@@ -216,6 +216,29 @@ pub struct Artifact {
 pub struct ChangedFile {
     pub path: String,
     pub status: ChangeStatus,
+    /// Immutable content before the attempt. Missing for newly added files and
+    /// legacy job records captured before content-complete evidence existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before: Option<FileEvidence>,
+    /// Immutable content after the attempt. Missing for deleted files and
+    /// legacy job records captured before content-complete evidence existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<FileEvidence>,
+}
+
+/// Reproducible evidence for one regular workspace file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileEvidence {
+    /// Algorithm-qualified digest of `bytes`.
+    pub digest: String,
+    /// Inline content retained by legacy and in-memory records. File-backed
+    /// graphs externalize this into `blob` before writing the SQLite row.
+    #[serde(default)]
+    pub bytes: Vec<u8>,
+    /// Content-addressed object reference, normally identical to `digest`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blob: Option<String>,
+    pub executable: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -269,6 +292,14 @@ pub struct JobResult {
     pub artifacts: Vec<Artifact>,
     pub tests: Vec<TestResult>,
     pub change_set: Option<ChangeSet>,
+    /// Exact container image identity when the local runtime can resolve it;
+    /// otherwise an explicitly `unresolved:` image reference.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executor_image: Option<String>,
+    /// Staged jobs ran outside the authoritative workspace. Their change set
+    /// must be promoted only by an approving human review.
+    #[serde(default)]
+    pub staged: bool,
     pub governance: GovernanceEnvelope,
 }
 
@@ -293,6 +324,8 @@ impl JobResult {
             artifacts: Vec::new(),
             tests: Vec::new(),
             change_set: None,
+            executor_image: None,
+            staged: false,
             governance,
         })
     }

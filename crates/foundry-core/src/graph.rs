@@ -12,8 +12,11 @@ use crate::job::{
     TransitionError,
 };
 use crate::living::ConformanceError;
+use crate::{
+    DiscourseAct, DiscourseSpeaker, DiscourseTurn, ReviewDraft, ReviewPerspective, ReviewResolution,
+};
 
-pub const LATEST_SCHEMA_VERSION: i64 = 5;
+pub const LATEST_SCHEMA_VERSION: i64 = 7;
 
 /// A unique node identifier in the production graph.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -198,6 +201,14 @@ pub enum GraphError {
     InvalidStoredResult(#[from] serde_json::Error),
     #[error(transparent)]
     NonconformingEvidence(#[from] ConformanceError),
+    #[error(transparent)]
+    EvidenceStore(#[from] crate::evidence_store::EvidenceStoreError),
+    #[error("invalid discourse turn: {0}")]
+    InvalidDiscourse(String),
+    #[error("checksum for migration {version} does not match known migration SQL")]
+    ChecksumMismatch { version: i64 },
+    #[error("unknown migration version {version} with no known migration content")]
+    UnknownMigration { version: i64 },
 }
 
 #[derive(Debug)]
@@ -267,13 +278,10 @@ impl Graph {
         // WAL mode: readers do not block writers and writes are durable.
         self.conn.pragma_update(None, "journal_mode", "WAL")?;
 
-        self.conn.execute(
-            "CREATE TABLE IF NOT EXISTS schema_migrations (
-                version INTEGER PRIMARY KEY,
-                applied_at TEXT NOT NULL
-            )",
-            [],
-        )?;
+        // Ensure the schema_migrations table matches the shared definition so
+        // that Graph and the exported MigrationStorage API operate on the same
+        // table shape (version, checksum, applied_at).
+        crate::db::schema::ensure_schema_migrations_table(&self.conn)?;
 
         let current: i64 = self
             .conn
@@ -282,102 +290,58 @@ impl Graph {
             })
             .unwrap_or(0);
 
-        let migrations: Vec<(i64, &str)> = vec![
-            (
-                1,
-                "CREATE TABLE IF NOT EXISTS nodes (
-                id TEXT PRIMARY KEY,
-                kind TEXT NOT NULL,
-                name TEXT NOT NULL,
-                payload TEXT NOT NULL,
-                created_at TEXT NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS idx_nodes_kind ON nodes(kind);
-            CREATE INDEX IF NOT EXISTS idx_nodes_name ON nodes(name);
+        let migrations = crate::migration_registry::migrations();
 
-            CREATE TABLE IF NOT EXISTS edges (
-                id TEXT PRIMARY KEY,
-                from_node TEXT NOT NULL,
-                to_node TEXT NOT NULL,
-                kind TEXT NOT NULL,
-                FOREIGN KEY (from_node) REFERENCES nodes(id),
-                FOREIGN KEY (to_node) REFERENCES nodes(id)
-            );
-            CREATE INDEX IF NOT EXISTS idx_edges_from ON edges(from_node);
-            CREATE INDEX IF NOT EXISTS idx_edges_to ON edges(to_node);
+        // Look up the expected SHA-256 checksum for every known migration from the
+        // canonical registry so that legacy rows are backfilled with the same
+        // digest that other consumers (such as MigrationStorage) would compute.
+        let expected_checksums: std::collections::HashMap<i64, String> = migrations
+            .iter()
+            .map(|(version, _)| {
+                (
+                    *version,
+                    crate::migration_registry::checksum_for(*version)
+                        .expect("migration has an expected checksum"),
+                )
+            })
+            .collect();
 
-            CREATE TABLE IF NOT EXISTS events (
-                id TEXT PRIMARY KEY,
-                kind TEXT NOT NULL,
-                payload TEXT NOT NULL,
-                created_at TEXT NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS idx_events_kind ON events(kind);
-
-            CREATE TABLE IF NOT EXISTS code_index (
-                id TEXT PRIMARY KEY,
-                node_id TEXT NOT NULL,
-                content TEXT NOT NULL,
-                FOREIGN KEY (node_id) REFERENCES nodes(id)
-            );
-            CREATE VIRTUAL TABLE IF NOT EXISTS code_search USING fts5(content);",
-            ),
-            (
-                2,
-                "CREATE TABLE IF NOT EXISTS code_embeddings (
-                node_id TEXT PRIMARY KEY,
-                embedding TEXT NOT NULL,
-                FOREIGN KEY (node_id) REFERENCES nodes(id)
-            );",
-            ),
-            (
-                3,
-                "CREATE TABLE IF NOT EXISTS task_states (
-                    task_key TEXT PRIMARY KEY,
-                    state TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS jobs (
-                    id TEXT PRIMARY KEY,
-                    task_key TEXT NOT NULL,
-                    idempotency_key TEXT NOT NULL UNIQUE,
-                    state TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                );
-                CREATE INDEX IF NOT EXISTS idx_jobs_task_key ON jobs(task_key);",
-            ),
-            (
-                4,
-                "CREATE TABLE IF NOT EXISTS job_results (
-                    job_id TEXT PRIMARY KEY,
-                    result TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    FOREIGN KEY (job_id) REFERENCES jobs(id)
-                );",
-            ),
-            (
-                5,
-                "CREATE TABLE IF NOT EXISTS reviews (
-                    id TEXT PRIMARY KEY,
-                    task_key TEXT NOT NULL,
-                    job_id TEXT NOT NULL,
-                    decision TEXT NOT NULL,
-                    reviewer TEXT NOT NULL,
-                    reason TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    FOREIGN KEY (job_id) REFERENCES jobs(id)
-                );
-                CREATE INDEX IF NOT EXISTS idx_reviews_task_key ON reviews(task_key);",
-            ),
-        ];
+        // Validate and backfill every row already in schema_migrations before
+        // applying any new migrations. Unknown versions or mismatched checksums
+        // are treated as data integrity errors.
+        let mut stmt = self
+            .conn
+            .prepare("SELECT version, checksum FROM schema_migrations")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?))
+        })?;
+        for row in rows {
+            let (version, checksum) = row?;
+            let expected = expected_checksums
+                .get(&version)
+                .ok_or(GraphError::UnknownMigration { version })?;
+            let stored = checksum.unwrap_or_default();
+            if stored.is_empty() {
+                self.conn.execute(
+                    "UPDATE schema_migrations SET checksum = ?1 WHERE version = ?2",
+                    params![expected, version],
+                )?;
+            } else if stored != *expected {
+                return Err(GraphError::ChecksumMismatch { version });
+            }
+        }
 
         for (version, sql) in migrations {
             if version > current {
                 self.conn.execute_batch(sql)?;
+                let checksum = expected_checksums
+                    .get(&version)
+                    .expect("migration has an expected checksum")
+                    .clone();
                 self.conn.execute(
-                    "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
-                    params![version, Utc::now().to_rfc3339()],
+                    "INSERT INTO schema_migrations (version, checksum, applied_at)
+                     VALUES (?1, ?2, ?3)",
+                    params![version, checksum, Utc::now().to_rfc3339()],
                 )?;
             }
         }
@@ -450,6 +414,123 @@ impl Graph {
         })?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(GraphError::Sqlite)
+    }
+
+    /// Append an immutable, reply-linked turn to a Socratic discourse.
+    pub fn record_discourse_turn(&mut self, turn: &DiscourseTurn) -> Result<(), GraphError> {
+        if turn.context_key.trim().is_empty() || turn.body.trim().is_empty() {
+            return Err(GraphError::InvalidDiscourse(
+                "context and body must be non-empty".into(),
+            ));
+        }
+        if let Some(reply_to) = turn.reply_to {
+            let parent_context: Option<String> = self
+                .conn
+                .query_row(
+                    "SELECT context_key FROM discourse_turns WHERE id = ?1",
+                    params![reply_to.to_string()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if parent_context.as_deref() != Some(turn.context_key.as_str()) {
+                return Err(GraphError::InvalidDiscourse(
+                    "a reply must reference a turn in the same context".into(),
+                ));
+            }
+        }
+        self.conn.execute(
+            "INSERT INTO discourse_turns
+             (id, context_key, speaker, act, body, reply_to, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                turn.id.to_string(),
+                turn.context_key,
+                turn.speaker.as_str(),
+                turn.act.as_str(),
+                turn.body,
+                turn.reply_to.map(|id| id.to_string()),
+                turn.created_at.to_rfc3339(),
+            ],
+        )?;
+        self.emit_event(&Event::DiscourseTurnRecorded {
+            turn_id: turn.id,
+            context_key: turn.context_key.clone(),
+            act: turn.act.as_str().into(),
+        })
+    }
+
+    /// Read a discourse in chronological order for later learning or review.
+    pub fn discourse_for_context(
+        &self,
+        context_key: &str,
+    ) -> Result<Vec<DiscourseTurn>, GraphError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, speaker, act, body, reply_to, created_at
+             FROM discourse_turns WHERE context_key = ?1 ORDER BY rowid",
+        )?;
+        let rows = stmt.query_map(params![context_key], |row| {
+            let id: String = row.get(0)?;
+            let speaker: String = row.get(1)?;
+            let act: String = row.get(2)?;
+            let reply_to: Option<String> = row.get(4)?;
+            let created_at: String = row.get(5)?;
+            let conversion_error = |column, value: String| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    column,
+                    rusqlite::types::Type::Text,
+                    Box::new(ColumnParseError(value)),
+                )
+            };
+            Ok(DiscourseTurn {
+                id: Uuid::parse_str(&id).map_err(|_| conversion_error(0, id))?,
+                context_key: context_key.into(),
+                speaker: DiscourseSpeaker::from_stored(&speaker)
+                    .ok_or_else(|| conversion_error(1, speaker))?,
+                act: DiscourseAct::from_stored(&act).ok_or_else(|| conversion_error(2, act))?,
+                body: row.get(3)?,
+                reply_to: reply_to
+                    .map(|value| Uuid::parse_str(&value).map_err(|_| conversion_error(4, value)))
+                    .transpose()?,
+                created_at: DateTime::parse_from_rfc3339(&created_at)
+                    .map_err(|_| conversion_error(5, created_at))?
+                    .with_timezone(&Utc),
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(GraphError::Sqlite)
+    }
+
+    /// Ensure a discourse begins with one explicit shared question.
+    pub fn ensure_discourse_question(
+        &mut self,
+        context_key: &str,
+        question: &str,
+    ) -> Result<Uuid, GraphError> {
+        let existing: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT id FROM discourse_turns
+                 WHERE context_key = ?1 AND act = 'question'
+                 ORDER BY rowid LIMIT 1",
+                params![context_key],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(existing) = existing {
+            return Uuid::parse_str(&existing).map_err(|_| {
+                GraphError::InvalidDiscourse("stored question id is not a UUID".into())
+            });
+        }
+        let turn = DiscourseTurn::new(
+            context_key,
+            DiscourseSpeaker::System,
+            DiscourseAct::Question,
+            question,
+            None,
+        );
+        let id = turn.id;
+        self.record_discourse_turn(&turn)?;
+        Ok(id)
     }
 
     /// Initialize a durable task lifecycle. Repeating the operation is idempotent.
@@ -553,11 +634,12 @@ impl Graph {
         if parse_job_state_value(&persisted)? != result.state || !result.state.is_terminal() {
             return Err(GraphError::ResultStateMismatch);
         }
+        let stored = crate::evidence_store::externalize_job_result(&self.conn, result)?;
         self.conn.execute(
             "INSERT OR IGNORE INTO job_results (job_id, result, created_at) VALUES (?1, ?2, ?3)",
             params![
                 result.job_id.0.to_string(),
-                serde_json::to_string(result)?,
+                serde_json::to_string(&stored)?,
                 Utc::now().to_rfc3339()
             ],
         )?;
@@ -573,8 +655,11 @@ impl Graph {
                 |row| row.get(0),
             )
             .optional()?;
-        json.map(|value| serde_json::from_str(&value).map_err(GraphError::from))
-            .transpose()
+        json.map(|value| {
+            let result = serde_json::from_str(&value)?;
+            crate::evidence_store::hydrate_job_result(&self.conn, result).map_err(GraphError::from)
+        })
+        .transpose()
     }
 
     /// Evidence is linked through its immutable job to the stable task key.
@@ -586,7 +671,8 @@ impl Graph {
         let rows = stmt.query_map(params![task_key], |row| row.get::<_, String>(0))?;
         rows.map(|row| {
             let json = row?;
-            serde_json::from_str(&json).map_err(GraphError::from)
+            let result = serde_json::from_str(&json)?;
+            crate::evidence_store::hydrate_job_result(&self.conn, result).map_err(GraphError::from)
         })
         .collect()
     }
@@ -654,6 +740,261 @@ impl Graph {
                 reviewer: row.get(3)?,
                 reason: row.get(4)?,
             })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(GraphError::Sqlite)
+    }
+
+    /// Persist immutable advisory review text. Drafts cannot transition task state.
+    pub fn record_review_draft(&mut self, draft: &ReviewDraft) -> Result<(), GraphError> {
+        let inserted = self.conn.execute(
+            "INSERT OR IGNORE INTO review_drafts
+             (id, task_key, job_id, perspective, recommendation, body, agent, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                draft.id.to_string(),
+                draft.task_key,
+                draft.job_id.0.to_string(),
+                draft.perspective.as_str(),
+                match draft.recommendation {
+                    ReviewDecision::Approve => "approve",
+                    ReviewDecision::Reject => "reject",
+                },
+                draft.body,
+                draft.agent,
+                draft.created_at.to_rfc3339(),
+            ],
+        )?;
+        if inserted == 1 {
+            let context_key = format!("review:{}", draft.job_id.0);
+            let question_id = self.ensure_discourse_question(
+                &context_key,
+                "Does the immutable evidence justify the proposed task decision, and what would falsify that conclusion?",
+            )?;
+            let turn = DiscourseTurn {
+                id: draft.id,
+                context_key,
+                speaker: DiscourseSpeaker::SocraticPartner,
+                act: match draft.perspective {
+                    ReviewPerspective::Evidence => DiscourseAct::Observation,
+                    ReviewPerspective::Adversarial => DiscourseAct::Challenge,
+                },
+                body: draft.body.clone(),
+                reply_to: Some(question_id),
+                created_at: draft.created_at,
+            };
+            self.record_discourse_turn(&turn)?;
+            self.emit_event(&Event::ReviewDrafted {
+                draft_id: draft.id,
+                job_id: draft.job_id,
+                perspective: draft.perspective.as_str().into(),
+            })?;
+        }
+        Ok(())
+    }
+
+    pub fn review_drafts_for_job(&self, job_id: JobId) -> Result<Vec<ReviewDraft>, GraphError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, task_key, perspective, recommendation, body, agent, created_at
+             FROM review_drafts WHERE job_id = ?1 ORDER BY perspective",
+        )?;
+        let rows = stmt.query_map(params![job_id.0.to_string()], |row| {
+            let id: String = row.get(0)?;
+            let id = Uuid::parse_str(&id).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?;
+            let perspective: String = row.get(2)?;
+            let recommendation: String = row.get(3)?;
+            let created_at: String = row.get(6)?;
+            let created_at = DateTime::parse_from_rfc3339(&created_at)
+                .map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        6,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?
+                .with_timezone(&Utc);
+            Ok(ReviewDraft {
+                id,
+                task_key: row.get(1)?,
+                job_id,
+                perspective: if perspective == "evidence" {
+                    ReviewPerspective::Evidence
+                } else {
+                    ReviewPerspective::Adversarial
+                },
+                recommendation: if recommendation == "approve" {
+                    ReviewDecision::Approve
+                } else {
+                    ReviewDecision::Reject
+                },
+                body: row.get(4)?,
+                agent: row.get(5)?,
+                created_at,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(GraphError::Sqlite)
+    }
+
+    /// Record the human-edited resolution. A pending review performs the
+    /// authoritative transition; an already-reviewed job records retrospective
+    /// learning without rewriting the historical decision or task state.
+    pub fn record_review_resolution(
+        &mut self,
+        resolution: &ReviewResolution,
+    ) -> Result<TaskState, GraphError> {
+        if let Some(draft_id) = resolution.selected_draft_id {
+            let count: i64 = self.conn.query_row(
+                "SELECT COUNT(*) FROM review_drafts
+                 WHERE id = ?1 AND task_key = ?2 AND job_id = ?3",
+                params![
+                    draft_id.to_string(),
+                    resolution.task_key,
+                    resolution.job_id.0.to_string()
+                ],
+                |row| row.get(0),
+            )?;
+            if count != 1 {
+                return Err(GraphError::ResultStateMismatch);
+            }
+        }
+
+        let task_state = self
+            .task_state(&resolution.task_key)?
+            .ok_or(GraphError::ResultStateMismatch)?;
+        let state = if task_state == TaskState::Review {
+            let review = Review {
+                task_key: resolution.task_key.clone(),
+                job_id: resolution.job_id,
+                decision: resolution.decision,
+                reviewer: resolution.reviewer.clone(),
+                reason: resolution.final_body.clone(),
+            };
+            self.record_review(&review)?
+        } else {
+            let recorded = self
+                .reviews_for_task(&resolution.task_key)?
+                .into_iter()
+                .find(|review| review.job_id == resolution.job_id)
+                .ok_or(GraphError::ResultStateMismatch)?;
+            if recorded.decision != resolution.decision {
+                return Err(GraphError::ResultStateMismatch);
+            }
+            task_state
+        };
+        self.conn.execute(
+            "INSERT INTO review_resolutions
+             (id, task_key, job_id, selected_draft_id, original_draft, final_body,
+              edit_similarity, decision, reviewer, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                resolution.id.to_string(),
+                resolution.task_key,
+                resolution.job_id.0.to_string(),
+                resolution.selected_draft_id.map(|id| id.to_string()),
+                resolution.original_draft,
+                resolution.final_body,
+                resolution.edit_similarity,
+                match resolution.decision {
+                    ReviewDecision::Approve => "approve",
+                    ReviewDecision::Reject => "reject",
+                },
+                resolution.reviewer,
+                resolution.created_at.to_rfc3339(),
+            ],
+        )?;
+        let context_key = format!("review:{}", resolution.job_id.0);
+        let question_id = self.ensure_discourse_question(
+            &context_key,
+            "Does the immutable evidence justify the proposed task decision, and what would falsify that conclusion?",
+        )?;
+        let reply_to = if let Some(draft_id) = resolution.selected_draft_id {
+            let exists: bool = self.conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM discourse_turns WHERE id = ?1)",
+                params![draft_id.to_string()],
+                |row| row.get(0),
+            )?;
+            if !exists {
+                let (body, perspective): (String, String) = self.conn.query_row(
+                    "SELECT body, perspective FROM review_drafts WHERE id = ?1",
+                    params![draft_id.to_string()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?;
+                self.record_discourse_turn(&DiscourseTurn {
+                    id: draft_id,
+                    context_key: context_key.clone(),
+                    speaker: DiscourseSpeaker::SocraticPartner,
+                    act: if perspective == "evidence" {
+                        DiscourseAct::Observation
+                    } else {
+                        DiscourseAct::Challenge
+                    },
+                    body,
+                    reply_to: Some(question_id),
+                    created_at: resolution.created_at,
+                })?;
+            }
+            draft_id
+        } else {
+            question_id
+        };
+        self.record_discourse_turn(&DiscourseTurn {
+            id: resolution.id,
+            context_key,
+            speaker: DiscourseSpeaker::Human,
+            act: DiscourseAct::Synthesis,
+            body: resolution.final_body.clone(),
+            reply_to: Some(reply_to),
+            created_at: resolution.created_at,
+        })?;
+        self.emit_event(&Event::ReviewResolved {
+            resolution_id: resolution.id,
+            job_id: resolution.job_id,
+            selected_draft_id: resolution.selected_draft_id,
+        })?;
+        Ok(state)
+    }
+
+    /// Human-authored resolutions are compact learning context for later reviews.
+    pub fn recent_review_lessons(&self, limit: usize) -> Result<Vec<String>, GraphError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT decision, final_body FROM review_resolutions
+             ORDER BY created_at DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit as i64], |row| {
+            Ok(format!(
+                "{}: {}",
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?
+            ))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(GraphError::Sqlite)
+    }
+
+    /// Human resolutions scoped to the task being decided. This avoids
+    /// treating unrelated historical prose as globally applicable policy.
+    pub fn review_lessons_for_task(
+        &self,
+        task_key: &str,
+        limit: usize,
+    ) -> Result<Vec<String>, GraphError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT decision, final_body FROM review_resolutions
+             WHERE task_key = ?1 ORDER BY created_at DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![task_key, limit as i64], |row| {
+            Ok(format!(
+                "{}: {}",
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?
+            ))
         })?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(GraphError::Sqlite)
@@ -1176,6 +1517,9 @@ impl Graph {
 
             // Explicit file links are the strongest expression of intent.
             for file in &task.files {
+                if file.starts_with("new:") {
+                    continue;
+                }
                 match self.find_node_by_name(NodeKind::Code, file)? {
                     Some(code) => {
                         self.create_edge(task_id, code.id, EdgeKind::DependsOn)?;
@@ -1252,6 +1596,537 @@ mod tests {
         let retrieved = graph.get_node(id).unwrap().unwrap();
         assert_eq!(retrieved.name, "bootstrap");
         assert_eq!(retrieved.kind, NodeKind::Task);
+    }
+
+    #[test]
+    fn migration_schema_stores_versions_with_sha256_checksums() {
+        let graph = Graph::open_in_memory().unwrap();
+        let mut statement = graph
+            .conn
+            .prepare("PRAGMA table_info(schema_migrations)")
+            .unwrap();
+        let columns = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, bool>(3)?,
+                    row.get::<_, bool>(5)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert!(
+            columns.contains(&("version".into(), "INTEGER".into(), false, true)),
+            "schema_migrations.version must be an INTEGER PRIMARY KEY"
+        );
+        assert!(
+            columns.contains(&("checksum".into(), "TEXT".into(), true, false)),
+            "schema_migrations.checksum must be required TEXT for a SHA-256 digest"
+        );
+    }
+
+    #[test]
+    fn upgrades_existing_schema_migrations_table_preserving_applied_at_and_backfilling_checksums() {
+        // Capture the checksums that the current migrations are expected to produce.
+        let fresh = Graph::open_in_memory().unwrap();
+        let mut expected_checksums = std::collections::HashMap::new();
+        {
+            let mut stmt = fresh
+                .conn
+                .prepare("SELECT version, checksum FROM schema_migrations ORDER BY version")
+                .unwrap();
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })
+                .unwrap();
+            for row in rows {
+                let (version, checksum) = row.unwrap();
+                expected_checksums.insert(version, checksum);
+            }
+        }
+
+        // Simulate a legacy graph database whose schema_migrations table only tracked
+        // the applied version and timestamp.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute(
+            "CREATE TABLE schema_migrations (
+                version INTEGER PRIMARY KEY NOT NULL,
+                applied_at TEXT NOT NULL
+            )",
+            [],
+        )
+        .unwrap();
+
+        let applied_at_values: Vec<&str> = vec![
+            "2021-01-01T00:00:00+00:00",
+            "2022-01-01T00:00:00+00:00",
+            "2023-01-01T00:00:00+00:00",
+            "2024-01-01T00:00:00+00:00",
+            "2025-01-01T00:00:00+00:00",
+        ];
+
+        for version in 1..=5 {
+            conn.execute(
+                "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+                params![version, applied_at_values[(version - 1) as usize]],
+            )
+            .unwrap();
+        }
+
+        let mut graph = Graph { conn };
+        graph.migrate().unwrap();
+
+        // The upgrade must add a checksum column to the existing table.
+        let mut stmt = graph
+            .conn
+            .prepare("PRAGMA table_info(schema_migrations)")
+            .unwrap();
+        let columns = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, bool>(3)?,
+                    row.get::<_, bool>(5)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(
+            columns.contains(&("checksum".into(), "TEXT".into(), true, false)),
+            "schema_migrations.checksum must be added as a required TEXT column"
+        );
+
+        // Every previously applied version must keep its original applied_at and have its
+        // checksum backfilled from the corresponding migration.
+        let mut stmt = graph
+            .conn
+            .prepare(
+                "SELECT version, checksum, applied_at FROM schema_migrations
+                 WHERE version <= 5 ORDER BY version",
+            )
+            .unwrap();
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert_eq!(rows.len(), 5);
+        for (version, checksum, applied_at) in rows {
+            assert_eq!(
+                expected_checksums.get(&version).unwrap(),
+                &checksum,
+                "checksum for version {} must be backfilled from the migration SQL",
+                version
+            );
+            assert_eq!(
+                applied_at_values[(version - 1) as usize],
+                applied_at,
+                "applied_at for version {} must be preserved during the upgrade",
+                version
+            );
+        }
+
+        assert_eq!(graph.schema_version().unwrap(), LATEST_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn upgrade_preserves_non_empty_checksums_and_only_backfills_empty_legacy_checksums() {
+        // A database that already has checksum storage must not have its recorded
+        // checksums overwritten: empty legacy checksums are backfilled, but any
+        // stored non-empty checksum is treated as authoritative.
+        let fresh = Graph::open_in_memory().unwrap();
+        let expected_v1_checksum: String = fresh
+            .conn
+            .query_row(
+                "SELECT checksum FROM schema_migrations WHERE version = 1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
+        let expected_v2_checksum: String = fresh
+            .conn
+            .query_row(
+                "SELECT checksum FROM schema_migrations WHERE version = 2",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
+        let expected_v3_checksum: String = fresh
+            .conn
+            .query_row(
+                "SELECT checksum FROM schema_migrations WHERE version = 3",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute(
+            "CREATE TABLE schema_migrations (
+                version INTEGER PRIMARY KEY NOT NULL,
+                checksum TEXT NOT NULL,
+                applied_at TEXT NOT NULL
+            )",
+            [],
+        )
+        .unwrap();
+
+        let applied_at_values: Vec<&str> = vec![
+            "2021-01-01T00:00:00+00:00",
+            "2022-01-01T00:00:00+00:00",
+            "2023-01-01T00:00:00+00:00",
+        ];
+
+        conn.execute(
+            "INSERT INTO schema_migrations (version, checksum, applied_at) VALUES (?1, ?2, ?3)",
+            params![1, expected_v1_checksum, applied_at_values[0]],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO schema_migrations (version, checksum, applied_at) VALUES (?1, ?2, ?3)",
+            params![2, "", applied_at_values[1]],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO schema_migrations (version, checksum, applied_at) VALUES (?1, ?2, ?3)",
+            params![3, expected_v3_checksum, applied_at_values[2]],
+        )
+        .unwrap();
+
+        let mut graph = Graph { conn };
+        graph.migrate().unwrap();
+
+        let mut stmt = graph
+            .conn
+            .prepare(
+                "SELECT version, checksum, applied_at FROM schema_migrations
+                 WHERE version <= 3 ORDER BY version",
+            )
+            .unwrap();
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert_eq!(rows.len(), 3);
+        for (version, checksum, applied_at) in rows {
+            match version {
+                1 => assert_eq!(
+                    checksum, expected_v1_checksum,
+                    "existing non-empty checksum for version {} must not be overwritten",
+                    version
+                ),
+                2 => assert_eq!(
+                    checksum, expected_v2_checksum,
+                    "empty legacy checksum for version {} must be backfilled from the migration SQL",
+                    version
+                ),
+                3 => assert_eq!(
+                    checksum, expected_v3_checksum,
+                    "existing non-empty checksum for version {} must not be overwritten",
+                    version
+                ),
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                applied_at_values[(version - 1) as usize],
+                applied_at,
+                "applied_at for version {} must be preserved during the upgrade",
+                version
+            );
+        }
+
+        assert_eq!(graph.schema_version().unwrap(), LATEST_SCHEMA_VERSION);
+    }
+
+    /// Regression: Graph::migrate and the exported MigrationStorage API must share a single
+    /// source of truth for the schema_migrations table. Comparing the full table definition
+    /// (name, type, nullability, default, primary-key) proves the two entry points do not
+    /// maintain parallel DDL that could diverge.
+    #[test]
+    fn graph_and_migration_storage_use_identical_schema_migrations_table() {
+        use crate::migration_storage::MigrationStorage;
+
+        let graph = Graph::open_in_memory().unwrap();
+        let storage = MigrationStorage::open_in_memory().unwrap();
+
+        fn table_info(conn: &Connection) -> Vec<(String, String, bool, Option<String>, bool)> {
+            let mut stmt = conn
+                .prepare("PRAGMA table_info(schema_migrations)")
+                .unwrap();
+            stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, bool>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, bool>(5)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+        }
+
+        assert_eq!(
+            table_info(&graph.conn),
+            table_info(storage.connection()),
+            "Graph::migrate and MigrationStorage must use the same schema_migrations table definition"
+        );
+    }
+
+    /// Legacy schema_migrations rows may represent a missing checksum as either NULL or the
+    /// empty string. The upgrade must backfill both representations from the migration SQL.
+    #[test]
+    fn upgrade_backfills_null_and_empty_legacy_checksums() {
+        let fresh = Graph::open_in_memory().unwrap();
+        let expected_v1_checksum: String = fresh
+            .conn
+            .query_row(
+                "SELECT checksum FROM schema_migrations WHERE version = 1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
+        let expected_v2_checksum: String = fresh
+            .conn
+            .query_row(
+                "SELECT checksum FROM schema_migrations WHERE version = 2",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute(
+            "CREATE TABLE schema_migrations (
+                version INTEGER PRIMARY KEY NOT NULL,
+                checksum TEXT,
+                applied_at TEXT NOT NULL
+            )",
+            [],
+        )
+        .unwrap();
+
+        conn.execute(
+            "INSERT INTO schema_migrations (version, checksum, applied_at) VALUES (?1, ?2, ?3)",
+            params![1, None::<String>, "2021-01-01T00:00:00+00:00"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO schema_migrations (version, checksum, applied_at) VALUES (?1, ?2, ?3)",
+            params![2, "", "2022-01-01T00:00:00+00:00"],
+        )
+        .unwrap();
+
+        let mut graph = Graph { conn };
+        graph.migrate().unwrap();
+
+        let v1_checksum: String = graph
+            .conn
+            .query_row(
+                "SELECT checksum FROM schema_migrations WHERE version = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let v2_checksum: String = graph
+            .conn
+            .query_row(
+                "SELECT checksum FROM schema_migrations WHERE version = 2",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert_eq!(
+            v1_checksum, expected_v1_checksum,
+            "NULL legacy checksum must be backfilled from the migration SQL"
+        );
+        assert_eq!(
+            v2_checksum, expected_v2_checksum,
+            "empty-string legacy checksum must be backfilled from the migration SQL"
+        );
+    }
+
+    /// A stored checksum must be the SHA-256 digest of the migration content that was actually
+    /// applied. If a legacy row already contains a checksum that does not match the known
+    /// migration SQL, migration must fail rather than silently accept a mismatched digest.
+    #[test]
+    fn migrate_rejects_stored_checksum_that_does_not_match_migration_sql() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute(
+            "CREATE TABLE schema_migrations (
+                version INTEGER PRIMARY KEY NOT NULL,
+                checksum TEXT NOT NULL,
+                applied_at TEXT NOT NULL
+            )",
+            [],
+        )
+        .unwrap();
+
+        let wrong_checksum = "0000000000000000000000000000000000000000000000000000000000000000";
+        conn.execute(
+            "INSERT INTO schema_migrations (version, checksum, applied_at) VALUES (?1, ?2, ?3)",
+            params![1, wrong_checksum, "2021-01-01T00:00:00+00:00"],
+        )
+        .unwrap();
+
+        let mut graph = Graph { conn };
+        let result = graph.migrate();
+        assert!(
+            result.is_err(),
+            "migrate must fail when a stored checksum does not match the SHA-256 of the migration SQL"
+        );
+    }
+
+    /// If a legacy database records a schema version for which no migration content is known,
+    /// the upgrade cannot backfill a checksum and must report an error instead of silently
+    /// leaving the row in an inconsistent state.
+    #[test]
+    fn migrate_fails_when_legacy_version_has_no_migration_content() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute(
+            "CREATE TABLE schema_migrations (
+                version INTEGER PRIMARY KEY NOT NULL,
+                checksum TEXT,
+                applied_at TEXT NOT NULL
+            )",
+            [],
+        )
+        .unwrap();
+
+        conn.execute(
+            "INSERT INTO schema_migrations (version, checksum, applied_at) VALUES (?1, ?2, ?3)",
+            params![100, None::<String>, "2021-01-01T00:00:00+00:00"],
+        )
+        .unwrap();
+
+        let mut graph = Graph { conn };
+        let result = graph.migrate();
+        assert!(
+            result.is_err(),
+            "migrate must fail when a legacy schema_migrations row references a version with no known migration content"
+        );
+    }
+
+    /// Regression (reviewer feedback): upgrading a legacy database in place must produce a
+    /// schema_migrations table that is identical to the canonical definition shared with
+    /// MigrationStorage. An ALTER TABLE upgrade can silently diverge in column order and
+    /// default values, so this test forces a single source of truth for the DDL.
+    #[test]
+    fn upgraded_legacy_database_uses_canonical_schema_migrations_definition() {
+        use crate::migration_storage::MigrationStorage;
+
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute(
+            "CREATE TABLE schema_migrations (
+                version INTEGER PRIMARY KEY NOT NULL,
+                applied_at TEXT NOT NULL
+            )",
+            [],
+        )
+        .unwrap();
+
+        for version in 1..=3 {
+            conn.execute(
+                "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+                params![version, format!("{}-01-01T00:00:00+00:00", 2020 + version)],
+            )
+            .unwrap();
+        }
+
+        let mut graph = Graph { conn };
+        graph.migrate().unwrap();
+
+        fn table_info(conn: &Connection) -> Vec<(String, String, bool, Option<String>, bool)> {
+            let mut stmt = conn
+                .prepare("PRAGMA table_info(schema_migrations)")
+                .unwrap();
+            stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, bool>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, bool>(5)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+        }
+
+        let storage = MigrationStorage::open_in_memory().unwrap();
+        assert_eq!(
+            table_info(&graph.conn),
+            table_info(storage.connection()),
+            "upgrading a legacy database must produce the same schema_migrations table definition as MigrationStorage"
+        );
+    }
+
+    /// Migration checksums must be backfilled from a canonical migration registry that is
+    /// independent of Graph::migrate's internal loop. This prevents the graph and any other
+    /// consumers (such as MigrationStorage) from computing divergent digests for the same
+    /// migration version.
+    #[test]
+    fn graph_backfills_legacy_checksums_from_canonical_migration_registry() {
+        let expected_v1_checksum = crate::migration_registry::checksum_for(1)
+            .expect("version 1 must be present in the canonical migration registry");
+
+        // Simulate a legacy graph database whose schema_migrations table only tracked
+        // the applied version and timestamp.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute(
+            "CREATE TABLE schema_migrations (
+                version INTEGER PRIMARY KEY NOT NULL,
+                applied_at TEXT NOT NULL
+            )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+            params![1, "2021-01-01T00:00:00+00:00"],
+        )
+        .unwrap();
+
+        let mut graph = Graph { conn };
+        graph.migrate().unwrap();
+
+        let checksum: String = graph
+            .conn
+            .query_row(
+                "SELECT checksum FROM schema_migrations WHERE version = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert_eq!(
+            checksum, expected_v1_checksum,
+            "backfilled checksum must come from the canonical migration registry"
+        );
     }
 
     #[test]
@@ -1367,6 +2242,68 @@ mod tests {
     }
 
     #[test]
+    fn file_backed_graph_externalizes_and_verifies_content_evidence() {
+        use sha2::{Digest, Sha256};
+
+        let root = std::env::temp_dir().join(format!("foundry-blobs-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let database = root.join("db.sqlite");
+        let mut graph = Graph::open(&database).unwrap();
+        let job = graph.create_job("task-a", "blob-evidence").unwrap();
+        graph.transition_job(job.id, JobState::Running).unwrap();
+        graph.transition_job(job.id, JobState::Succeeded).unwrap();
+        let bytes = b"large distinctive staged content".to_vec();
+        let digest = format!("sha256:{:x}", Sha256::digest(&bytes));
+        let mut result =
+            JobResult::new(job.id, JobState::Succeeded, evidence_governance()).unwrap();
+        result.change_set = Some(crate::ChangeSet {
+            base_revision: "sha256:base".into(),
+            patch_digest: "sha256:patch".into(),
+            files: vec![crate::ChangedFile {
+                path: "result.txt".into(),
+                status: crate::ChangeStatus::Added,
+                before: None,
+                after: Some(crate::FileEvidence {
+                    digest: digest.clone(),
+                    bytes: bytes.clone(),
+                    blob: None,
+                    executable: false,
+                }),
+            }],
+        });
+        graph.record_job_result(&result).unwrap();
+
+        let raw: String = graph
+            .conn
+            .query_row(
+                "SELECT result FROM job_results WHERE job_id = ?1",
+                params![job.id.0.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(raw.contains("\"bytes\":[]"));
+        assert!(raw.contains(&format!("\"blob\":\"{digest}\"")));
+        let object = root
+            .join("blobs/sha256")
+            .join(digest.trim_start_matches("sha256:"));
+        assert_eq!(std::fs::read(&object).unwrap(), bytes);
+
+        let hydrated = graph.job_result(job.id).unwrap().unwrap();
+        assert_eq!(
+            hydrated.change_set.as_ref().unwrap().files[0]
+                .after
+                .as_ref()
+                .unwrap()
+                .bytes,
+            b"large distinctive staged content"
+        );
+        std::fs::remove_file(&object).unwrap();
+        assert!(graph.job_result(job.id).is_err());
+        drop(graph);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn review_decision_is_recorded_before_task_transition() {
         let mut graph = Graph::open_in_memory().unwrap();
         graph
@@ -1391,6 +2328,212 @@ mod tests {
         };
         assert_eq!(graph.record_review(&review).unwrap(), TaskState::Done);
         assert_eq!(graph.reviews_for_task("task-a").unwrap(), vec![review]);
+    }
+
+    #[test]
+    fn advisory_drafts_require_a_human_resolution_to_transition_state() {
+        let mut graph = Graph::open_in_memory().unwrap();
+        graph
+            .initialize_task_state("task-reviewed", TaskState::Ready)
+            .unwrap();
+        graph
+            .transition_task("task-reviewed", TaskState::Running)
+            .unwrap();
+        let job = graph.create_job("task-reviewed", "draft-review-1").unwrap();
+        graph.transition_job(job.id, JobState::Running).unwrap();
+        graph.transition_job(job.id, JobState::Succeeded).unwrap();
+        graph
+            .record_job_result(
+                &JobResult::new(job.id, JobState::Succeeded, evidence_governance()).unwrap(),
+            )
+            .unwrap();
+        graph
+            .transition_task("task-reviewed", TaskState::Review)
+            .unwrap();
+
+        let evidence = ReviewDraft {
+            id: Uuid::new_v4(),
+            task_key: "task-reviewed".into(),
+            job_id: job.id,
+            perspective: ReviewPerspective::Evidence,
+            recommendation: ReviewDecision::Approve,
+            body: "Tests support approval".into(),
+            agent: "test-agent".into(),
+            created_at: Utc::now(),
+        };
+        let adversarial = ReviewDraft {
+            id: Uuid::new_v4(),
+            perspective: ReviewPerspective::Adversarial,
+            recommendation: ReviewDecision::Reject,
+            body: "Compatibility evidence is missing".into(),
+            ..evidence.clone()
+        };
+        graph.record_review_draft(&evidence).unwrap();
+        graph.record_review_draft(&adversarial).unwrap();
+        assert_eq!(
+            graph.task_state("task-reviewed").unwrap(),
+            Some(TaskState::Review)
+        );
+        assert_eq!(graph.review_drafts_for_job(job.id).unwrap().len(), 2);
+
+        let resolution = ReviewResolution {
+            id: Uuid::new_v4(),
+            task_key: "task-reviewed".into(),
+            job_id: job.id,
+            selected_draft_id: Some(adversarial.id),
+            original_draft: Some(adversarial.body.clone()),
+            final_body: "Reject until compatibility is tested".into(),
+            edit_similarity: Some(0.5),
+            decision: ReviewDecision::Reject,
+            reviewer: "human@example.test".into(),
+            created_at: Utc::now(),
+        };
+        assert_eq!(
+            graph.record_review_resolution(&resolution).unwrap(),
+            TaskState::Ready
+        );
+        assert!(
+            graph
+                .recent_review_lessons(1)
+                .unwrap()
+                .first()
+                .unwrap()
+                .contains("compatibility")
+        );
+        let discourse = graph
+            .discourse_for_context(&format!("review:{}", job.id.0))
+            .unwrap();
+        assert_eq!(discourse.len(), 4);
+        assert_eq!(discourse[0].act, DiscourseAct::Question);
+        assert_eq!(discourse[1].speaker, DiscourseSpeaker::SocraticPartner);
+        assert_eq!(discourse[2].speaker, DiscourseSpeaker::SocraticPartner);
+        assert_eq!(discourse[3].speaker, DiscourseSpeaker::Human);
+        assert_eq!(discourse[3].act, DiscourseAct::Synthesis);
+        assert_eq!(discourse[3].reply_to, Some(adversarial.id));
+    }
+
+    #[test]
+    fn discourse_replies_must_remain_in_their_shared_context() {
+        let mut graph = Graph::open_in_memory().unwrap();
+        let question = DiscourseTurn::new(
+            "proposal:one",
+            DiscourseSpeaker::Human,
+            DiscourseAct::Question,
+            "What outcome are we trying to improve?",
+            None,
+        );
+        graph.record_discourse_turn(&question).unwrap();
+        let answer = DiscourseTurn::new(
+            "proposal:one",
+            DiscourseSpeaker::SocraticPartner,
+            DiscourseAct::Synthesis,
+            "The observed bottleneck is review latency.",
+            Some(question.id),
+        );
+        graph.record_discourse_turn(&answer).unwrap();
+
+        let cross_context = DiscourseTurn::new(
+            "proposal:two",
+            DiscourseSpeaker::Human,
+            DiscourseAct::Challenge,
+            "Does that evidence apply here?",
+            Some(answer.id),
+        );
+        assert!(matches!(
+            graph.record_discourse_turn(&cross_context),
+            Err(GraphError::InvalidDiscourse(_))
+        ));
+
+        assert_eq!(
+            graph.discourse_for_context("proposal:one").unwrap(),
+            vec![question, answer]
+        );
+    }
+
+    #[test]
+    fn retrospective_resolution_preserves_the_recorded_rejection_and_adds_learning() {
+        let mut graph = Graph::open_in_memory().unwrap();
+        graph
+            .initialize_task_state("task-retrospective", TaskState::Ready)
+            .unwrap();
+        graph
+            .transition_task("task-retrospective", TaskState::Running)
+            .unwrap();
+        let job = graph
+            .create_job("task-retrospective", "retrospective-1")
+            .unwrap();
+        graph.transition_job(job.id, JobState::Running).unwrap();
+        graph.transition_job(job.id, JobState::Succeeded).unwrap();
+        graph
+            .record_job_result(
+                &JobResult::new(job.id, JobState::Succeeded, evidence_governance()).unwrap(),
+            )
+            .unwrap();
+        graph
+            .transition_task("task-retrospective", TaskState::Review)
+            .unwrap();
+        graph
+            .record_review(&Review {
+                task_key: "task-retrospective".into(),
+                job_id: job.id,
+                decision: ReviewDecision::Reject,
+                reviewer: "human@example.test".into(),
+                reason: "The original rejection".into(),
+            })
+            .unwrap();
+
+        let draft = ReviewDraft {
+            id: Uuid::new_v4(),
+            task_key: "task-retrospective".into(),
+            job_id: job.id,
+            perspective: ReviewPerspective::Adversarial,
+            recommendation: ReviewDecision::Reject,
+            body: "The checksum overwrite erases tampering evidence".into(),
+            agent: "test-agent".into(),
+            created_at: Utc::now(),
+        };
+        graph.record_review_draft(&draft).unwrap();
+        let resolution = ReviewResolution {
+            id: Uuid::new_v4(),
+            task_key: "task-retrospective".into(),
+            job_id: job.id,
+            selected_draft_id: Some(draft.id),
+            original_draft: Some(draft.body.clone()),
+            final_body: "Never overwrite a stored non-empty checksum".into(),
+            edit_similarity: Some(0.4),
+            decision: ReviewDecision::Reject,
+            reviewer: "human@example.test".into(),
+            created_at: Utc::now(),
+        };
+
+        assert_eq!(
+            graph.record_review_resolution(&resolution).unwrap(),
+            TaskState::Ready
+        );
+        assert_eq!(
+            graph.task_state("task-retrospective").unwrap(),
+            Some(TaskState::Ready)
+        );
+        assert_eq!(
+            graph.reviews_for_task("task-retrospective").unwrap().len(),
+            1,
+            "retrospective learning must not duplicate the authoritative review"
+        );
+        assert!(
+            graph
+                .recent_review_lessons(1)
+                .unwrap()
+                .first()
+                .unwrap()
+                .contains("Never overwrite")
+        );
+
+        let conflicting = ReviewResolution {
+            id: Uuid::new_v4(),
+            decision: ReviewDecision::Approve,
+            ..resolution
+        };
+        assert!(graph.record_review_resolution(&conflicting).is_err());
     }
 
     #[test]

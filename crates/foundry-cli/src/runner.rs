@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, bail};
-use foundry_core::{ChangeSet, ChangeStatus, ChangedFile, JobId, JobSpec};
+use foundry_core::{ChangeSet, ChangeStatus, ChangedFile, FileEvidence, JobId, JobSpec};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::Read;
@@ -12,6 +13,9 @@ use std::sync::{
 use std::thread;
 use std::time::{Duration, Instant};
 use walkdir::WalkDir;
+
+/// Content-complete evidence for every relevant regular file in a workspace.
+pub type WorkspaceSnapshot = BTreeMap<String, FileEvidence>;
 
 #[derive(Debug)]
 pub struct RunnerOutput {
@@ -34,8 +38,9 @@ pub fn run_podman(
         bail!("job command cannot be empty");
     }
     let name = format!("foundry-job-{}", JobId::new().0);
-    let args = spec.podman_args(image, &root.to_string_lossy(), &name);
-    let before = snapshot(root)?;
+    let mut args = spec.podman_args(image, &root.to_string_lossy(), &name);
+    add_cargo_cache_mount(spec, &mut args)?;
+    let before = snapshot_workspace(root)?;
     let started = Instant::now();
     let mut child = Command::new("podman")
         .args(&args)
@@ -77,7 +82,7 @@ pub fn run_podman(
     let stderr = stderr_reader
         .join()
         .map_err(|_| anyhow::anyhow!("stderr reader panicked"))??;
-    let after = snapshot(root)?;
+    let after = snapshot_workspace(root)?;
     let change_set = compare_snapshots(&before, &after);
     Ok(RunnerOutput {
         exit_code: status.code(),
@@ -90,11 +95,54 @@ pub fn run_podman(
     })
 }
 
-fn snapshot(root: &Path) -> Result<BTreeMap<String, String>> {
+fn add_cargo_cache_mount(spec: &JobSpec, args: &mut Vec<String>) -> Result<()> {
+    if spec.command.first().map(String::as_str) != Some("cargo") {
+        return Ok(());
+    }
+    let cargo_home = std::env::var_os("FOUNDRY_CARGO_HOME")
+        .or_else(|| std::env::var_os("CARGO_HOME"))
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(std::path::PathBuf::from)
+                .map(|home| home.join(".cargo"))
+        })
+        .context("cannot locate Cargo home for offline sandbox")?;
+    if !cargo_home.join("registry").is_dir() {
+        bail!(
+            "Cargo registry cache is missing at {}; run `cargo fetch --locked` first or set FOUNDRY_CARGO_HOME",
+            cargo_home.display()
+        );
+    }
+
+    // Insert runner options immediately before IMAGE and COMMAND.
+    let image_index = args
+        .len()
+        .checked_sub(spec.command.len() + 1)
+        .context("invalid Podman argument layout")?;
+    args.splice(
+        image_index..image_index,
+        [
+            "--volume".into(),
+            format!("{}:/foundry-cargo:ro", cargo_home.display()),
+            "--env".into(),
+            "CARGO_HOME=/foundry-cargo".into(),
+            "--env".into(),
+            "CARGO_NET_OFFLINE=true".into(),
+        ],
+    );
+    Ok(())
+}
+
+pub fn snapshot_workspace(root: &Path) -> Result<WorkspaceSnapshot> {
     let mut files = BTreeMap::new();
     for entry in WalkDir::new(root).into_iter().filter_entry(|entry| {
         let name = entry.file_name().to_string_lossy();
-        !entry.file_type().is_dir() || !matches!(name.as_ref(), ".git" | ".foundry" | "target")
+        !entry.file_type().is_dir()
+            || !matches!(
+                name.as_ref(),
+                ".git" | ".foundry" | ".foundry-agent-tmp" | "target"
+            )
     }) {
         let entry = entry?;
         if !entry.file_type().is_file() {
@@ -102,28 +150,41 @@ fn snapshot(root: &Path) -> Result<BTreeMap<String, String>> {
         }
         let relative = entry.path().strip_prefix(root).unwrap_or(entry.path());
         let bytes = fs::read(entry.path())?;
+        #[cfg(unix)]
+        let executable = {
+            use std::os::unix::fs::PermissionsExt;
+            entry.metadata()?.permissions().mode() & 0o111 != 0
+        };
+        #[cfg(not(unix))]
+        let executable = false;
         files.insert(
             relative.to_string_lossy().into_owned(),
-            stable_digest(&bytes),
+            FileEvidence {
+                digest: sha256_digest(&bytes),
+                bytes,
+                blob: None,
+                executable,
+            },
         );
     }
     Ok(files)
 }
 
-fn compare_snapshots(
-    before: &BTreeMap<String, String>,
-    after: &BTreeMap<String, String>,
-) -> ChangeSet {
+pub fn compare_snapshots(before: &WorkspaceSnapshot, after: &WorkspaceSnapshot) -> ChangeSet {
     let mut files = Vec::new();
-    for (path, digest) in after {
+    for (path, evidence) in after {
         match before.get(path) {
             None => files.push(ChangedFile {
                 path: path.clone(),
                 status: ChangeStatus::Added,
+                before: None,
+                after: Some(evidence.clone()),
             }),
-            Some(previous) if previous != digest => files.push(ChangedFile {
+            Some(previous) if previous != evidence => files.push(ChangedFile {
                 path: path.clone(),
                 status: ChangeStatus::Modified,
+                before: Some(previous.clone()),
+                after: Some(evidence.clone()),
             }),
             _ => {}
         }
@@ -133,37 +194,47 @@ fn compare_snapshots(
             files.push(ChangedFile {
                 path: path.clone(),
                 status: ChangeStatus::Deleted,
+                before: before.get(path).cloned(),
+                after: None,
             });
         }
     }
     files.sort_by(|a, b| a.path.cmp(&b.path));
-    let mut patch = Vec::new();
-    for file in &files {
-        patch.extend_from_slice(file.path.as_bytes());
-        patch.extend_from_slice(format!("{:?}", file.status).as_bytes());
-        if let Some(digest) = after.get(&file.path) {
-            patch.extend_from_slice(digest.as_bytes());
-        }
-    }
     let mut base = Vec::new();
-    for (path, digest) in before {
+    for (path, evidence) in before {
         base.extend_from_slice(path.as_bytes());
-        base.extend_from_slice(digest.as_bytes());
+        base.extend_from_slice(evidence.digest.as_bytes());
     }
     ChangeSet {
-        base_revision: stable_digest(&base),
-        patch_digest: stable_digest(&patch),
+        base_revision: sha256_digest(&base),
+        patch_digest: patch_digest(&files),
         files,
     }
 }
 
-fn stable_digest(bytes: &[u8]) -> String {
-    let mut hash = 0xcbf29ce484222325_u64;
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100000001b3);
+pub fn patch_digest(files: &[ChangedFile]) -> String {
+    let mut patch = Vec::new();
+    for file in files {
+        patch.extend_from_slice(file.path.as_bytes());
+        patch.extend_from_slice(format!("{:?}", file.status).as_bytes());
+        if let Some(evidence) = &file.before {
+            patch.extend_from_slice(evidence.digest.as_bytes());
+        }
+        if let Some(evidence) = &file.after {
+            patch.extend_from_slice(evidence.digest.as_bytes());
+        }
     }
-    format!("fnv1a64:{hash:016x}")
+    sha256_digest(&patch)
+}
+
+/// Compare a previously captured baseline with the workspace as it exists now.
+pub fn changes_since(before: &WorkspaceSnapshot, root: &Path) -> Result<ChangeSet> {
+    let after = snapshot_workspace(root)?;
+    Ok(compare_snapshots(before, &after))
+}
+
+pub fn sha256_digest(bytes: &[u8]) -> String {
+    format!("sha256:{:x}", Sha256::digest(bytes))
 }
 
 fn read_all(mut reader: impl Read) -> Result<String> {
@@ -182,25 +253,33 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("modified.txt"), "before").unwrap();
         fs::write(root.join("deleted.txt"), "gone").unwrap();
-        let before = snapshot(&root).unwrap();
+        let before = snapshot_workspace(&root).unwrap();
         fs::write(root.join("modified.txt"), "after").unwrap();
         fs::remove_file(root.join("deleted.txt")).unwrap();
         fs::write(root.join("added.txt"), "new").unwrap();
-        let after = snapshot(&root).unwrap();
+        let after = snapshot_workspace(&root).unwrap();
         let changes = compare_snapshots(&before, &after);
         assert_eq!(changes.files.len(), 3);
         assert!(changes.files.contains(&ChangedFile {
             path: "added.txt".into(),
-            status: ChangeStatus::Added
+            status: ChangeStatus::Added,
+            before: None,
+            after: after.get("added.txt").cloned(),
         }));
         assert!(changes.files.contains(&ChangedFile {
             path: "modified.txt".into(),
-            status: ChangeStatus::Modified
+            status: ChangeStatus::Modified,
+            before: before.get("modified.txt").cloned(),
+            after: after.get("modified.txt").cloned(),
         }));
         assert!(changes.files.contains(&ChangedFile {
             path: "deleted.txt".into(),
-            status: ChangeStatus::Deleted
+            status: ChangeStatus::Deleted,
+            before: before.get("deleted.txt").cloned(),
+            after: None,
         }));
+        assert!(changes.base_revision.starts_with("sha256:"));
+        assert!(changes.patch_digest.starts_with("sha256:"));
         fs::remove_dir_all(root).unwrap();
     }
 }

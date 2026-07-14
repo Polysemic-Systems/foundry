@@ -68,7 +68,16 @@ ask query:
 
 # Execute the next undone task in the bootstrap plan
 iterate:
-    cargo run -p foundry-cli -- iterate --plan ./plans/bootstrap.plan.md --root . --db ./.foundry/db.sqlite
+    @cargo run --quiet -p foundry-cli -- iterate --plan ./plans/bootstrap.plan.md --root . --db ./.foundry/db.sqlite
+
+# Execute the next feature task through a test-first editor agent.
+# Set FOUNDRY_AGENT_COMMAND, for example: codex exec --full-auto -
+iterate-tdd *args:
+    @cargo run --quiet -p foundry-cli -- iterate --tdd --plan ./plans/features.plan.md --root . --db ./.foundry/db.sqlite {{args}}
+
+# Compare two generated review drafts and submit the edited human resolution.
+review-tui task job reviewer:
+    @cargo run --quiet -p foundry-cli -- review-tui --root . --db ./.foundry/db.sqlite --task {{quote(task)}} --job {{job}} --reviewer {{quote(reviewer)}}
 
 # Show the bootstrap plan
 plan:
@@ -95,7 +104,7 @@ dev:
     cargo watch -x "test --workspace"
 
 # Container image used by the Podman sandbox
-sandbox_image := env("SANDBOX_IMAGE", "docker.io/rust:1-bookworm")
+sandbox_image := env("SANDBOX_IMAGE", "docker.io/rust:1.92-bookworm")
 
 # Run a command inside a rootless Podman sandbox (mounts the project at /workspace)
 sandbox *args:

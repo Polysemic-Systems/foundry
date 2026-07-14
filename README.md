@@ -24,6 +24,7 @@ does not advance until the captured job is explicitly reviewed:
 ```bash
 just iterate
 cargo run -p foundry-cli -- review-approve \
+  --root . \
   --task 'plans/bootstrap.plan.md#task-1' --job <job-uuid> \
   --reviewer <identity> --reason '<evidence-based decision>'
 just iterate  # reflects the approval in the plan and selects the next task
@@ -31,6 +32,109 @@ just iterate  # reflects the approval in the plan and selects the next task
 
 Use `review-reject` with the same arguments to return the task to `ready` for a
 new attempt. Reusing an idempotency key returns the original immutable result.
+
+### Evidence-grounded review TUI
+
+For successful jobs, Foundry prepares two structurally independent advisory
+reviews: a deterministic evidence-policy audit and a model-generated adversarial
+critique. The drafts are immutable graph records and cannot transition task
+state. Only the final edited and attributable human resolution has authority:
+
+```bash
+export FOUNDRY_REVIEW_AGENT_COMMAND='kimi --prompt'
+just review-tui 'plans/features.plan.md#task-4' <job-uuid> megloff1
+```
+
+If that job already has a human review, the same command opens a retrospective
+session. Foundry keeps the historical decision and task state fixed while
+storing the selected/edited rationale as learning context for later agents.
+
+Staged jobs retain SHA-256-addressed before/after bytes for every changed file,
+the aggregate patch digest, executor image identity, command output, and test
+results. Review prompts receive bounded content previews; the complete bytes
+remain in the durable `JobResult`. Sandbox jobs print a compact verification
+summary by default. Direct
+`job-run` callers that need the complete machine-readable record can pass
+`--json`; the full stdout and stderr are always retained as durable evidence in
+SQLite.
+
+### Socratic discourse
+
+Every decision-bearing model interaction follows one discourse contract: begin
+with a shared question, separate observations from assumptions, surface a
+competing interpretation, identify falsifying evidence, and leave authority
+with the human. Questions must be capable of changing a decision or next
+action; routine status output remains direct.
+
+Foundry persists these interactions as typed, reply-linked `discourse_turns`
+with accountable speakers and epistemic acts (`question`, `observation`,
+`assumption`, `challenge`, and `synthesis`). Review drafts become evidence and
+adversarial partner turns; the edited human resolution becomes the final
+synthesis retained for future learning.
+
+The interface shows both drafts side by side. Use `1` or `2` as an editable
+starting point, `0` to write an independent review, `e` to edit, `a`/`r` to set
+the decision, and `s` to sign and submit. Foundry stores both originals, the
+selected draft, the final text, edit similarity, reviewer identity, and the
+decision. Later review prompts receive recent human resolutions as learning
+context; rejected resolutions also become acceptance constraints for the next
+TDD attempt. Generated drafts remain advisory regardless of their recommendation.
+
+### Test-driven iteration
+
+Foundry can delegate workspace edits to an external agent while retaining its
+own sandboxed verification and review gate. Configure an agent that accepts its
+instructions on standard input, then run the feature plan:
+
+```bash
+export FOUNDRY_AGENT_COMMAND='codex exec --full-auto -'
+export FOUNDRY_AGENT_NETWORK=on # explicit consent for a remote coding agent
+just iterate-tdd
+```
+
+Agents that require the prompt as a command argument are also supported when
+the configured command ends in `--prompt` or `-p`, for example
+`FOUNDRY_AGENT_COMMAND='kimi --prompt'`.
+
+Foundry copies the authoritative workspace into `.foundry/attempts/` and gives
+only that copy write access through Bubblewrap. The sandbox uses an empty root
+with only system runtime files, the attempt, a clean temporary home, and an
+allowlist of the selected agent's authentication/configuration files mounted;
+the user's home and prior agent sessions are not visible. Network access is
+disabled unless `FOUNDRY_AGENT_NETWORK=on` is explicitly set. It first proves
+the task command is green. The red phase must add
+or modify only dedicated tests (or an existing Rust `#[cfg(test)]` section), and
+the command must then fail. The green phase cannot change or remove the test
+that established the red failure. Foundry then verifies the implementation in
+network-disabled Podman and records the staged patch as durable evidence.
+Rejection discards the staged outcome. Approval conflict-checks and promotes the
+recorded bytes into the authoritative workspace through an exclusive,
+crash-recoverable promotion journal. Tasks without a `- run:` tag use
+`cargo test` in TDD mode.
+
+Bubblewrap is required by default. `FOUNDRY_AGENT_SANDBOX=off` is an explicit,
+warning-producing compatibility escape hatch for systems that cannot provide
+it; using that setting weakens host-write isolation.
+
+For file-backed graphs, change bytes are stored once in
+`.foundry/blobs/sha256/`; SQLite stores immutable digest references rather than
+large byte arrays. Reads hydrate and verify those objects and fail closed when
+an object is missing or corrupt. Legacy inline evidence remains readable.
+
+Rejected reviews are active inputs to the next TDD attempt: Foundry loads the
+latest rejection reason and its job evidence from the graph and asks the test
+phase to reproduce the rejected behavior. If durable verification fails because
+of compilation or tests, the next iteration invokes a repair phase with that
+output. Failures classified as runner infrastructure are retried without asking
+the editor agent to change application code.
+
+Use `just iterate-tdd --debug-runner` to print the effective Podman image,
+network mode, resource limits, and environment, then run a non-durable
+`rustc --version` preflight before agents or durable verification jobs start.
+
+Plan file hints are executable contracts. Referenced files must exist; an
+intentional creation must use `new:path`. Run commands must pass Foundry's safe
+command parser before a proposal can be appended or a task can execute.
 
 ## Design
 

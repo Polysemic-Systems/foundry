@@ -1,4 +1,6 @@
 use crate::graph::NodeId;
+use crate::job::JobId;
+use uuid::Uuid;
 
 /// Domain events are the only way subsystems communicate.
 /// Each event is typed, versioned, and stored.
@@ -29,10 +31,28 @@ pub enum Event {
         prompt_tokens: u64,
         cost_usd: f64,
     },
+    /// A typed turn was added to a Socratic discourse.
+    DiscourseTurnRecorded {
+        turn_id: Uuid,
+        context_key: String,
+        act: String,
+    },
     /// A rule was triggered.
     RuleTriggered { rule_id: NodeId, result: RuleResult },
     /// A review stop point was reached.
     ReviewRequested { review_id: NodeId, task_id: NodeId },
+    /// An immutable advisory review draft was generated.
+    ReviewDrafted {
+        draft_id: Uuid,
+        job_id: JobId,
+        perspective: String,
+    },
+    /// A human edited review drafts and made the authoritative decision.
+    ReviewResolved {
+        resolution_id: Uuid,
+        job_id: JobId,
+        selected_draft_id: Option<Uuid>,
+    },
     /// A task started executing.
     TaskStarted {
         task_id: NodeId,
@@ -82,8 +102,11 @@ impl Event {
             Event::PlanIndexed { .. } => "plan_indexed",
             Event::CodeIndexed { .. } => "code_indexed",
             Event::ModelInvoked { .. } => "model_invoked",
+            Event::DiscourseTurnRecorded { .. } => "discourse_turn_recorded",
             Event::RuleTriggered { .. } => "rule_triggered",
             Event::ReviewRequested { .. } => "review_requested",
+            Event::ReviewDrafted { .. } => "review_drafted",
+            Event::ReviewResolved { .. } => "review_resolved",
             Event::TaskStarted { .. } => "task_started",
             Event::TaskCompleted { .. } => "task_completed",
             Event::TaskFailed { .. } => "task_failed",
