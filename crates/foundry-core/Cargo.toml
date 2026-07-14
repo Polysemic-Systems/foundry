@@ -1,0 +1,14 @@
+[package]
+name = "foundry-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+thiserror.workspace = true
+chrono.workspace = true
+rusqlite = { version = "0.34", features = ["bundled", "chrono"] }
+uuid = { version = "1", features = ["v4", "serde"] }
