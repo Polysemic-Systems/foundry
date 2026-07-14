@@ -5,6 +5,10 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+pub fn network_enabled() -> bool {
+    std::env::var("FOUNDRY_AGENT_NETWORK").is_ok_and(|value| value.eq_ignore_ascii_case("on"))
+}
+
 pub fn run_editor(root: &Path, agent_command: &str, prompt: &str) -> Result<()> {
     let mut parts = parse_command(agent_command)?;
     let prompt_as_argument = matches!(parts.last().map(String::as_str), Some("--prompt" | "-p"));
@@ -129,8 +133,17 @@ fn sandboxed_command(
     let executable = resolve_executable(program)?;
     let clean_home = scratch.join("home");
     prepare_agent_home(&executable, &clean_home)?;
-    let network_enabled =
-        std::env::var("FOUNDRY_AGENT_NETWORK").is_ok_and(|value| value.eq_ignore_ascii_case("on"));
+    let network_enabled = network_enabled();
+    let remote_agent = matches!(
+        executable.file_name().and_then(OsStr::to_str),
+        Some("codex" | "kimi")
+    );
+    if remote_agent && !network_enabled {
+        bail!(
+            "remote editor agent `{}` needs outbound network access; explicitly consent with `export FOUNDRY_AGENT_NETWORK=on`, then retry",
+            executable.file_name().unwrap_or_default().to_string_lossy()
+        );
+    }
     if network_enabled {
         eprintln!(
             "warning: FOUNDRY_AGENT_NETWORK=on; the agent can transmit files visible inside its isolated workspace"

@@ -2146,6 +2146,18 @@ fn cmd_iterate(
 
     if debug_runner {
         debug_runner_preflight(root)?;
+        if tdd {
+            let enabled = agent_sandbox::network_enabled();
+            println!(
+                "Editor agent network: {}{}",
+                if enabled { "enabled" } else { "disabled" },
+                if enabled {
+                    " (explicit FOUNDRY_AGENT_NETWORK=on consent)"
+                } else {
+                    " (remote Codex/Kimi agents require FOUNDRY_AGENT_NETWORK=on)"
+                }
+            );
+        }
     }
 
     // The verification container starts after the editor agent has changed the
@@ -2610,7 +2622,7 @@ fn debug_runner_preflight(root: &Path) -> Result<()> {
     let root = root.canonicalize().context("resolving workspace root")?;
     ensure_container_toolchain(&mut spec, &image, &root)?;
     println!("Runner debug image: {image}");
-    println!("Runner debug network: disabled");
+    println!("Verification runner network: disabled");
     println!("Runner debug environment: {:?}", spec.environment);
     println!(
         "Runner debug command: {:?}",
