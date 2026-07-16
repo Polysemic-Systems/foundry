@@ -35,6 +35,15 @@ jobs:
           repository: Polysemic-Systems/polysemic
           path: polysemic
 
+      # The TDD vertical-slice tests exercise real Bubblewrap isolation.
+      # Ubuntu 24.04 restricts unprivileged user namespaces via AppArmor by
+      # default; relax it for the runner so bwrap can create its sandbox.
+      - name: Install Bubblewrap for agent-isolation tests
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+
       - name: Install the pinned toolchain
         working-directory: foundry
         run: rustup show active-toolchain || rustup toolchain install
