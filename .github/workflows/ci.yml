@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: Format, lint, and test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      CARGO_TERM_COLOR: always
+
+    steps:
+      # Foundry consumes digest/lethe/polysemic-core as path dependencies
+      # from the sibling checkout: ../polysemic must exist next to foundry/.
+      - name: Check out foundry
+        uses: actions/checkout@v6
+        with:
+          path: foundry
+
+      - name: Check out the sibling polysemic workspace
+        uses: actions/checkout@v6
+        with:
+          repository: Polysemic-Systems/polysemic
+          path: polysemic
+
+      - name: Install the pinned toolchain
+        working-directory: foundry
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: foundry
+
+      - name: Check formatting
+        working-directory: foundry
+        run: cargo fmt --all -- --check
+
+      - name: Lint with clippy
+        working-directory: foundry
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Run tests
+        working-directory: foundry
+        run: cargo test --workspace
