@@ -21,19 +21,56 @@ pub fn validate_red_phase_changes(change_set: &foundry_core::ChangeSet) -> Resul
     Ok(())
 }
 
+/// The red phase may add its test to an existing `#[cfg(test)]` section of an
+/// implementation file, and the green phase may then need to edit that same
+/// file — demanding byte-identity would forbid legal implementations. The
+/// enforced invariant is line survival: every line the red phase added must
+/// still be present after green. Dedicated test files must stay untouched.
 pub fn validate_green_preserves_red(root: &Path, red: &foundry_core::ChangeSet) -> Result<()> {
     let current = runner::snapshot_workspace(root)
         .context("capturing workspace after the TDD green phase")?;
-    let changed = red
-        .files
-        .iter()
-        .filter(|change| current.get(&change.path) != change.after.as_ref())
-        .map(|change| change.path.as_str())
-        .collect::<Vec<_>>();
-    if !changed.is_empty() {
+    let mut violations = Vec::new();
+    for change in &red.files {
+        let Some(after) = change.after.as_ref() else {
+            continue;
+        };
+        let current_evidence = current.get(&change.path);
+        if current_evidence == Some(after) {
+            continue;
+        }
+        let dedicated_test_file = Path::new(&change.path)
+            .components()
+            .any(|component| component.as_os_str() == "tests");
+        if dedicated_test_file {
+            violations.push(change.path.as_str());
+            continue;
+        }
+        let Some(current_evidence) = current_evidence else {
+            violations.push(change.path.as_str());
+            continue;
+        };
+        let before_text = change
+            .before
+            .as_ref()
+            .map(|evidence| String::from_utf8_lossy(&evidence.bytes).into_owned())
+            .unwrap_or_default();
+        let after_text = String::from_utf8_lossy(&after.bytes).into_owned();
+        let current_text = String::from_utf8_lossy(&current_evidence.bytes).into_owned();
+        let before_lines: std::collections::BTreeSet<&str> = before_text.lines().collect();
+        let current_lines: std::collections::BTreeSet<&str> = current_text.lines().collect();
+        let red_added_missing = after_text
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .filter(|line| !before_lines.contains(line))
+            .any(|line| !current_lines.contains(line));
+        if red_added_missing {
+            violations.push(change.path.as_str());
+        }
+    }
+    if !violations.is_empty() {
         bail!(
             "TDD green phase changed or removed the test that established the red failure: {}",
-            changed.join(", ")
+            violations.join(", ")
         );
     }
     Ok(())
@@ -98,6 +135,50 @@ mod tests {
             patch_digest: "sha256:patch".into(),
             files: vec![file],
         }
+    }
+
+    #[test]
+    fn green_may_share_the_red_file_but_never_lose_the_red_test() {
+        let root = std::env::temp_dir().join(format!("foundry-tdd-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let before = "pub fn snapshot() {}\n#[cfg(test)]\nmod tests {}\n";
+        let red_after = "pub fn snapshot() {}\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn wal_is_checkpointed() { assert!(false); }\n}\n";
+        let red = changes(ChangedFile {
+            path: "src/main.rs".into(),
+            status: ChangeStatus::Modified,
+            before: Some(evidence(before)),
+            after: Some(evidence(red_after)),
+        });
+
+        // Green implements in the same file and keeps the red test: legal.
+        let green = red_after.replace(
+            "pub fn snapshot() {}",
+            "pub fn snapshot() { checkpoint(); }\nfn checkpoint() {}",
+        );
+        std::fs::write(root.join("src/main.rs"), &green).unwrap();
+        assert!(validate_green_preserves_red(&root, &red).is_ok());
+
+        // Green removes the red test's assertion line: violation.
+        let weakened = green.replace("    fn wal_is_checkpointed() { assert!(false); }\n", "");
+        std::fs::write(root.join("src/main.rs"), &weakened).unwrap();
+        assert!(validate_green_preserves_red(&root, &red).is_err());
+
+        // An untouched dedicated test file is fine; an edited one is not.
+        std::fs::write(root.join("src/main.rs"), &green).unwrap();
+        std::fs::create_dir_all(root.join("tests")).unwrap();
+        let dedicated_body = "#[test]\nfn proves() { assert!(false); }\n";
+        std::fs::write(root.join("tests/red.rs"), dedicated_body).unwrap();
+        let dedicated = changes(ChangedFile {
+            path: "tests/red.rs".into(),
+            status: ChangeStatus::Added,
+            before: None,
+            after: Some(evidence(dedicated_body)),
+        });
+        assert!(validate_green_preserves_red(&root, &dedicated).is_ok());
+        std::fs::write(root.join("tests/red.rs"), "// gutted\n").unwrap();
+        assert!(validate_green_preserves_red(&root, &dedicated).is_err());
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

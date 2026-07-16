@@ -19,6 +19,7 @@ pub fn prepare(root: &Path, task_key: &str) -> Result<PathBuf> {
         .unwrap_or("invalid")
         .to_owned();
     let destination = attempts.join(key);
+    link_sibling_path_dependencies(&root, &attempts)?;
     if destination.is_dir() {
         return Ok(destination);
     }
@@ -38,6 +39,43 @@ pub fn prepare(root: &Path, task_key: &str) -> Result<PathBuf> {
         )
     })?;
     Ok(destination)
+}
+
+/// The workspace may reference sibling path dependencies (`../<name>/…`).
+/// An attempt copy lives under `.foundry/attempts/<hash>`, so its `../`
+/// resolves inside the attempts directory: link each referenced sibling
+/// there, pointing at the real one. The link is for resolution only — the
+/// container mount that follows it is read-only, and the editor-agent
+/// sandbox never binds it at all.
+fn link_sibling_path_dependencies(root: &Path, attempts: &Path) -> Result<()> {
+    let Ok(manifest) = fs::read_to_string(root.join("Cargo.toml")) else {
+        return Ok(());
+    };
+    let Some(parent) = root.parent() else {
+        return Ok(());
+    };
+    for capture in manifest.split("path = \"../").skip(1) {
+        let Some(name) = capture.split('"').next().and_then(|r| r.split('/').next()) else {
+            continue;
+        };
+        if name.is_empty() || name.contains("..") {
+            continue;
+        }
+        let source = parent.join(name);
+        let link = attempts.join(name);
+        if !source.is_dir() || link.exists() {
+            continue;
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&source, &link).with_context(|| {
+            format!(
+                "linking sibling path dependency {} into {}",
+                source.display(),
+                link.display()
+            )
+        })?;
+    }
+    Ok(())
 }
 
 pub fn discard(path: &Path) -> Result<()> {

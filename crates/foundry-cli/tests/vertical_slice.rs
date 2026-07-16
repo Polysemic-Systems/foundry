@@ -225,8 +225,22 @@ fn iterate_waits_for_recorded_review_before_advancing_plan() {
     fs::remove_dir_all(root).unwrap();
 }
 
+/// The TDD tests exercise real Bubblewrap isolation. Environments without
+/// bwrap (e.g. Foundry verifying itself inside its own Podman runner) skip
+/// them with a named reason; CI installs bwrap and enforces full coverage.
+fn bwrap_available() -> bool {
+    std::process::Command::new("bwrap")
+        .arg("--version")
+        .output()
+        .is_ok()
+}
+
 #[test]
 fn tdd_job_evidence_captures_changes_made_before_sandbox_verification() {
+    if !bwrap_available() {
+        eprintln!("skipping: bwrap unavailable in this environment");
+        return;
+    }
     let root = std::env::temp_dir().join(format!(
         "foundry-agent-evidence-test-{}",
         uuid::Uuid::new_v4()
@@ -327,6 +341,10 @@ fn tdd_job_evidence_captures_changes_made_before_sandbox_verification() {
 
 #[test]
 fn tdd_job_evidence_keeps_the_pre_agent_baseline_across_failed_verification_retries() {
+    if !bwrap_available() {
+        eprintln!("skipping: bwrap unavailable in this environment");
+        return;
+    }
     let root = std::env::temp_dir().join(format!(
         "foundry-agent-retry-evidence-test-{}",
         uuid::Uuid::new_v4()
@@ -445,6 +463,10 @@ fn tdd_job_evidence_keeps_the_pre_agent_baseline_across_failed_verification_retr
 
 #[test]
 fn staged_tdd_changes_reach_the_authoritative_workspace_only_after_approval() {
+    if !bwrap_available() {
+        eprintln!("skipping: bwrap unavailable in this environment");
+        return;
+    }
     let root = std::env::temp_dir().join(format!(
         "foundry-staged-promotion-test-{}",
         uuid::Uuid::new_v4()

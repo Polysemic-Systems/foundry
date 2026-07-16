@@ -131,17 +131,21 @@ fn sandboxed_command(
         );
     }
     let executable = resolve_executable(program)?;
+    // Identity comes from the name the operator invoked, never the
+    // canonicalized target: version-managed installs symlink `claude` to a
+    // file literally named `2.1.211`, and matching on that silently skips
+    // credential preparation and the network-consent gate.
+    let invoked_name = Path::new(program)
+        .file_name()
+        .and_then(OsStr::to_str)
+        .unwrap_or(program);
     let clean_home = scratch.join("home");
-    prepare_agent_home(&executable, &clean_home)?;
+    prepare_agent_home(invoked_name, &clean_home)?;
     let network_enabled = network_enabled();
-    let remote_agent = matches!(
-        executable.file_name().and_then(OsStr::to_str),
-        Some("codex" | "kimi")
-    );
+    let remote_agent = matches!(invoked_name, "codex" | "kimi" | "claude");
     if remote_agent && !network_enabled {
         bail!(
-            "remote editor agent `{}` needs outbound network access; explicitly consent with `export FOUNDRY_AGENT_NETWORK=on`, then retry",
-            executable.file_name().unwrap_or_default().to_string_lossy()
+            "remote editor agent `{invoked_name}` needs outbound network access; explicitly consent with `export FOUNDRY_AGENT_NETWORK=on`, then retry",
         );
     }
     if network_enabled {
@@ -271,14 +275,14 @@ fn resolve_executable(program: &str) -> Result<PathBuf> {
     bail!("agent executable not found on PATH: {program}")
 }
 
-fn prepare_agent_home(executable: &Path, clean_home: &Path) -> Result<()> {
+fn prepare_agent_home(invoked_name: &str, clean_home: &Path) -> Result<()> {
     fs::create_dir_all(clean_home)?;
     let host_home = std::env::var_os("HOME").map(PathBuf::from);
     let Some(host_home) = host_home else {
         return Ok(());
     };
-    match executable.file_name().and_then(OsStr::to_str) {
-        Some("codex") => {
+    match invoked_name {
+        "codex" => {
             for relative in [
                 ".codex/auth.json",
                 ".codex/config.toml",
@@ -287,13 +291,25 @@ fn prepare_agent_home(executable: &Path, clean_home: &Path) -> Result<()> {
                 copy_private_config(&host_home, clean_home, relative)?;
             }
         }
-        Some("kimi") => {
+        "kimi" => {
             for relative in [
                 ".kimi-code/config.toml",
                 ".kimi-code/tui.toml",
                 ".kimi-code/device_id",
                 ".kimi-code/credentials/kimi-code.json",
                 ".kimi-code/oauth/kimi-code",
+            ] {
+                copy_private_config(&host_home, clean_home, relative)?;
+            }
+        }
+        "claude" => {
+            // Claude Code: OAuth credentials plus top-level config. Session
+            // history, projects, and plugins stay on the host — the agent
+            // sees only what authentication requires.
+            for relative in [
+                ".claude/.credentials.json",
+                ".claude/settings.json",
+                ".claude.json",
             ] {
                 copy_private_config(&host_home, clean_home, relative)?;
             }

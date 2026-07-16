@@ -3257,6 +3257,12 @@ fn snapshot_dir(db: &Path) -> PathBuf {
 
 fn cmd_snapshot_create(_root: &Path, db: &Path, name: Option<String>) -> Result<()> {
     let graph = Graph::open(db).with_context(|| format!("opening graph at {:?}", db))?;
+    // Closing a connection only checkpoints when it is the last one anywhere;
+    // checkpoint explicitly so the copy below includes transactions still in
+    // the WAL even while other foundry processes hold the database open.
+    graph
+        .checkpoint_wal()
+        .with_context(|| format!("checkpointing WAL of {:?} before snapshot", db))?;
     drop(graph);
 
     let name = name.unwrap_or_else(|| chrono::Local::now().format("%Y%m%d-%H%M%S").to_string());
