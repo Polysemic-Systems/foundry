@@ -1011,6 +1011,29 @@ impl Graph {
     /// Record the human-edited resolution. A pending review performs the
     /// authoritative transition; an already-reviewed job records retrospective
     /// learning without rewriting the historical decision or task state.
+    /// A review decision is actionable only when the job belongs to the
+    /// named task and that task is awaiting review. Callers must enforce
+    /// this before any side effect of the decision — promoting staged bytes
+    /// on the strength of an unvalidated task/job pair is a gate bypass.
+    pub fn validate_review_binding(&self, task_key: &str, job_id: JobId) -> Result<(), GraphError> {
+        let job_task: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT task_key FROM jobs WHERE id = ?1",
+                params![job_id.0.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match job_task {
+            Some(owner) if owner == task_key => {}
+            _ => return Err(GraphError::ResultStateMismatch),
+        }
+        if self.task_state(task_key)? != Some(TaskState::Review) {
+            return Err(GraphError::ResultStateMismatch);
+        }
+        Ok(())
+    }
+
     pub fn record_review_resolution(
         &mut self,
         resolution: &ReviewResolution,
@@ -2450,6 +2473,38 @@ mod tests {
                 .iter()
                 .filter(|report| report.version != 2 && report.version != 9999)
                 .all(|report| report.status == MigrationChecksumStatus::Verified)
+        );
+    }
+
+    #[test]
+    fn review_binding_refuses_mismatched_or_unreviewable_pairs() {
+        let mut graph = Graph::open_in_memory().unwrap();
+        graph
+            .initialize_task_state("task-a", TaskState::Ready)
+            .unwrap();
+        graph.transition_task("task-a", TaskState::Running).unwrap();
+        let job = graph.create_job("task-a", "binding-1").unwrap();
+        graph.transition_job(job.id, JobState::Running).unwrap();
+        graph.transition_job(job.id, JobState::Succeeded).unwrap();
+
+        // Task not yet in review: the decision is not actionable.
+        assert!(graph.validate_review_binding("task-a", job.id).is_err());
+        graph.transition_task("task-a", TaskState::Review).unwrap();
+        assert!(graph.validate_review_binding("task-a", job.id).is_ok());
+
+        // A job belonging to another task must never authorize promotion,
+        // whatever state the named task is in.
+        graph
+            .initialize_task_state("task-b", TaskState::Ready)
+            .unwrap();
+        graph.transition_task("task-b", TaskState::Running).unwrap();
+        graph.transition_task("task-b", TaskState::Review).unwrap();
+        assert!(graph.validate_review_binding("task-b", job.id).is_err());
+        // Unknown job: refused.
+        assert!(
+            graph
+                .validate_review_binding("task-a", JobId(Uuid::new_v4()))
+                .is_err()
         );
     }
 

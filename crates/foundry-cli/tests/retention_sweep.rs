@@ -170,6 +170,23 @@ fn sweep_erases_only_due_evidence_and_leaves_receipts() {
         assert!(graph.job_result_exists(result_a.job_id).unwrap());
     }
 
+    // Blobs younger than the sweep's age guard are presumed owned by a job
+    // that is still externalizing and are left alone; age this test's blobs
+    // past the guard so enforcement treats them as settled evidence.
+    {
+        let graph = Graph::open(&db).unwrap();
+        let blob_root = graph.blob_store_root().unwrap().unwrap();
+        for entry in fs::read_dir(&blob_root).unwrap() {
+            let path = entry.unwrap().path();
+            let aged = Command::new("touch")
+                .args(["-d", "2 hours ago"])
+                .arg(&path)
+                .status()
+                .unwrap();
+            assert!(aged.success());
+        }
+    }
+
     // Enforcement erases job A only.
     let enforced = cli.sweep(true);
     assert_eq!(enforced["deleted"].as_u64(), Some(1));

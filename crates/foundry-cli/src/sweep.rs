@@ -220,6 +220,11 @@ struct BlobStoreAdapter {
     graph: Rc<RefCell<Graph>>,
     root: Option<PathBuf>,
     manifests: BTreeMap<String, Vec<String>>,
+    /// Blobs younger than this are presumed to belong to a job that is still
+    /// externalizing (bytes land before the row) and are neither deleted nor
+    /// counted against verification. The same guard the orphan collector
+    /// uses; a race can otherwise destroy a finishing job's fresh evidence.
+    minimum_age: std::time::Duration,
 }
 
 impl BlobStoreAdapter {
@@ -229,6 +234,17 @@ impl BlobStoreAdapter {
             return None;
         }
         Some(root.join(hex))
+    }
+
+    /// True when the file is old enough that no in-flight externalization
+    /// can still own it. Erase and verify share this predicate so a young
+    /// blob is consistently treated as out of scope for the subject.
+    fn old_enough(&self, path: &Path) -> bool {
+        std::fs::metadata(path)
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|modified| std::time::SystemTime::now().duration_since(modified).ok())
+            .is_some_and(|age| age >= self.minimum_age)
     }
 
     fn still_referenced(&self) -> Result<BTreeSet<String>, lethe::store::AdapterError> {
@@ -280,6 +296,10 @@ impl ErasureAdapter for BlobStoreAdapter {
             let Some(path) = Self::digest_path(&root, digest) else {
                 continue;
             };
+            if path.exists() && !self.old_enough(&path) {
+                // A concurrent job may still own this byte-identical blob.
+                continue;
+            }
             match std::fs::remove_file(&path) {
                 Ok(()) => deleted.push(digest.clone()),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -310,6 +330,7 @@ impl ErasureAdapter for BlobStoreAdapter {
             }
             if let Some(path) = Self::digest_path(&root, digest)
                 && path.exists()
+                && self.old_enough(&path)
             {
                 return Ok(false);
             }
@@ -425,6 +446,7 @@ pub fn run_sweep(db: &Path, enforce: bool, json: bool) -> Result<()> {
             graph: Rc::clone(&graph),
             root,
             manifests,
+            minimum_age: std::time::Duration::from_secs(3600),
         }),
     ])
     .map_err(|error| anyhow::anyhow!("building erasure coordinator: {error:?}"))?;
@@ -711,6 +733,7 @@ mod tests {
                 graph: Rc::clone(&graph),
                 root: blob_root.clone(),
                 manifests: manifests.clone(),
+                minimum_age: std::time::Duration::ZERO,
             }),
         ])
         .unwrap();
@@ -754,6 +777,7 @@ mod tests {
                 graph: Rc::clone(&graph),
                 root: blob_root,
                 manifests,
+                minimum_age: std::time::Duration::ZERO,
             }),
         ])
         .unwrap();

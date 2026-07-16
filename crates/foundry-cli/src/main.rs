@@ -488,6 +488,16 @@ fn cmd_review(
         bail!("reviewer and reason must be non-empty");
     }
     let mut graph = Graph::open(db).with_context(|| format!("opening graph at {db:?}"))?;
+    // Authority first, side effects second: the job must belong to this task
+    // and the task must be awaiting review BEFORE any staged bytes move.
+    graph
+        .validate_review_binding(task_key, job_id)
+        .with_context(|| {
+            format!(
+                "review of job {} is not actionable for task {task_key}",
+                job_id.0
+            )
+        })?;
     let review = Review {
         task_key: task_key.into(),
         job_id,
@@ -507,6 +517,10 @@ fn cmd_review(
         reviewer: reviewer.into(),
         created_at: chrono::Utc::now(),
     };
+    // Promotion runs before the resolution is recorded because promotion is
+    // idempotent and journaled: a crash here leaves the task in Review and
+    // re-running the same approval converges. The reverse order would record
+    // a Done task whose approved bytes never landed, with no retry path.
     if decision == ReviewDecision::Approve {
         promote_staged_job(root, &graph, task_key, job_id)?;
     }
@@ -609,6 +623,10 @@ fn cmd_review_tui(
         created_at: chrono::Utc::now(),
     };
     if !retrospective && outcome.decision == ReviewDecision::Approve {
+        // Same authority-before-side-effects rule as cmd_review.
+        graph
+            .validate_review_binding(task_key, job_id)
+            .context("review decision is no longer actionable for this task/job pair")?;
         promote_staged_result(root, task_key, &result)?;
     }
     let state = graph.record_review_resolution(&resolution)?;
@@ -3314,6 +3332,15 @@ fn cmd_snapshot_restore(_root: &Path, db: &Path, name: &str, force: bool) -> Res
             return Ok(());
         }
     }
+    // Restoring rewinds history wholesale: evidence erased after this
+    // snapshot reappears as rows (their erasure receipts vanish with the
+    // rewind, and rows whose blobs were already collected become
+    // unhydratable). Retention enforcement does not survive a restore —
+    // re-run `sweep --enforce` afterwards and treat pre-restore erasure
+    // receipts as claims about a timeline this database no longer has.
+    println!(
+        "warning: restore rewinds retention history; evidence erased after the snapshot will reappear. Re-run `foundry sweep --enforce` after restoring."
+    );
 
     let graph = Graph::open(db).with_context(|| format!("opening graph at {:?}", db))?;
     drop(graph);
