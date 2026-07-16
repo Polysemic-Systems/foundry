@@ -40,6 +40,7 @@ pub fn run_podman(
     let name = format!("foundry-job-{}", JobId::new().0);
     let mut args = spec.podman_args(image, &root.to_string_lossy(), &name);
     add_cargo_cache_mount(spec, &mut args)?;
+    add_path_dependency_mounts(spec, root, &mut args)?;
     let before = snapshot_workspace(root)?;
     let started = Instant::now();
     let mut child = Command::new("podman")
@@ -95,6 +96,58 @@ pub fn run_podman(
     })
 }
 
+/// Workspace `path = "../<sibling>/…"` dependencies live outside the mounted
+/// workspace, so a cargo job inside the container cannot see them. Mount each
+/// referenced sibling read-only at the container path its relative reference
+/// resolves to (`../polysemic` from `/workspace` is `/polysemic`).
+fn add_path_dependency_mounts(spec: &JobSpec, root: &Path, args: &mut Vec<String>) -> Result<()> {
+    if spec.command.first().map(String::as_str) != Some("cargo") {
+        return Ok(());
+    }
+    let manifest = root.join("Cargo.toml");
+    let Ok(text) = std::fs::read_to_string(&manifest) else {
+        return Ok(());
+    };
+    let Some(parent) = root.parent() else {
+        return Ok(());
+    };
+    let mut siblings: Vec<String> = Vec::new();
+    for capture in text.split("path = \"../").skip(1) {
+        let Some(reference) = capture.split('"').next() else {
+            continue;
+        };
+        let Some(name) = reference.split('/').next() else {
+            continue;
+        };
+        if name.is_empty() || name.contains("..") || siblings.iter().any(|s| s == name) {
+            continue;
+        }
+        siblings.push(name.to_string());
+    }
+    if siblings.is_empty() {
+        return Ok(());
+    }
+    let image_index = args
+        .len()
+        .checked_sub(spec.command.len() + 1)
+        .context("invalid Podman argument layout")?;
+    let mut mounts = Vec::new();
+    for name in siblings {
+        let host = parent.join(&name);
+        if !host.is_dir() {
+            bail!(
+                "workspace references path dependency ../{name} but {} does not exist",
+                host.display()
+            );
+        }
+        // Attempts reach their siblings through symlinks; mount the target.
+        let host = host.canonicalize().unwrap_or(host);
+        mounts.extend(["--volume".into(), format!("{}:/{name}:ro", host.display())]);
+    }
+    args.splice(image_index..image_index, mounts);
+    Ok(())
+}
+
 fn add_cargo_cache_mount(spec: &JobSpec, args: &mut Vec<String>) -> Result<()> {
     if spec.command.first().map(String::as_str) != Some("cargo") {
         return Ok(());
@@ -120,17 +173,33 @@ fn add_cargo_cache_mount(spec: &JobSpec, args: &mut Vec<String>) -> Result<()> {
         .len()
         .checked_sub(spec.command.len() + 1)
         .context("invalid Podman argument layout")?;
-    args.splice(
-        image_index..image_index,
-        [
+    // Mount only the caches, never the host cargo config: config.toml names
+    // host policy (sccache wrappers, clang/mold linkers, custom profiles)
+    // that must not leak into the hermetic verification container. The empty
+    // wrapper overrides are belt and braces for configs found elsewhere.
+    let mut mounts = vec![
+        "--volume".into(),
+        format!(
+            "{}:/foundry-cargo/registry:ro",
+            cargo_home.join("registry").display()
+        ),
+        "--env".into(),
+        "CARGO_HOME=/foundry-cargo".into(),
+        "--env".into(),
+        "CARGO_NET_OFFLINE=true".into(),
+        "--env".into(),
+        "RUSTC_WRAPPER=".into(),
+        "--env".into(),
+        "RUSTC_WORKSPACE_WRAPPER=".into(),
+    ];
+    let git_cache = cargo_home.join("git");
+    if git_cache.is_dir() {
+        mounts.extend([
             "--volume".into(),
-            format!("{}:/foundry-cargo:ro", cargo_home.display()),
-            "--env".into(),
-            "CARGO_HOME=/foundry-cargo".into(),
-            "--env".into(),
-            "CARGO_NET_OFFLINE=true".into(),
-        ],
-    );
+            format!("{}:/foundry-cargo/git:ro", git_cache.display()),
+        ]);
+    }
+    args.splice(image_index..image_index, mounts);
     Ok(())
 }
 
@@ -246,6 +315,80 @@ fn read_all(mut reader: impl Read) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn path_dependency_siblings_are_mounted_read_only() {
+        let parent = std::env::temp_dir().join(format!("foundry-mounts-{}", JobId::new().0));
+        let root = parent.join("app");
+        fs::create_dir_all(root.join("crates")).unwrap();
+        fs::create_dir_all(parent.join("sibling/crates/dep")).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace.dependencies]\n\
+             dep = { path = \"../sibling/crates/dep\" }\n\
+             dep2 = { package = \"x\", path = \"../sibling/crates/other\" }\n\
+             local = { path = \"crates/local\" }\n",
+        )
+        .unwrap();
+
+        let spec = JobSpec {
+            command: vec!["cargo".into(), "test".into()],
+            working_directory: "/workspace".into(),
+            environment: Default::default(),
+            timeout_seconds: 60,
+            cpu_limit: None,
+            memory_limit_bytes: None,
+            network_enabled: false,
+        };
+        let mut args: Vec<String> = vec![
+            "run".into(),
+            "--rm".into(),
+            "img".into(),
+            "cargo".into(),
+            "test".into(),
+        ];
+        add_path_dependency_mounts(&spec, &root, &mut args).unwrap();
+        let volume = format!("{}:/sibling:ro", parent.join("sibling").display());
+        assert_eq!(
+            args,
+            vec![
+                "run".to_string(),
+                "--rm".into(),
+                "--volume".into(),
+                volume,
+                "img".into(),
+                "cargo".into(),
+                "test".into(),
+            ],
+            "one read-only mount per referenced sibling, before the image"
+        );
+
+        // A referenced sibling that does not exist is an error, not a
+        // confusing in-container failure.
+        fs::write(
+            root.join("Cargo.toml"),
+            "dep = { path = \"../missing/crates/dep\" }\n",
+        )
+        .unwrap();
+        let mut args: Vec<String> = vec!["run".into(), "img".into(), "cargo".into(), "test".into()];
+        assert!(add_path_dependency_mounts(&spec, &root, &mut args).is_err());
+
+        // Non-cargo commands are untouched.
+        let spec = JobSpec {
+            command: vec!["ls".into()],
+            working_directory: "/workspace".into(),
+            environment: Default::default(),
+            timeout_seconds: 60,
+            cpu_limit: None,
+            memory_limit_bytes: None,
+            network_enabled: false,
+        };
+        let mut args: Vec<String> = vec!["run".into(), "img".into(), "ls".into()];
+        add_path_dependency_mounts(&spec, &root, &mut args).unwrap();
+        assert_eq!(args, vec!["run", "img", "ls"]);
+
+        fs::remove_dir_all(parent).unwrap();
+    }
 
     #[test]
     fn snapshots_capture_added_modified_and_deleted_files() {

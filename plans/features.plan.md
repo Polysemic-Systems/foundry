@@ -17,3 +17,4 @@
 15. [x] Modify `crates/foundry-cli/src/main.rs` to obtain a mutable graph handle and integrate the logic for emitting a `RuleTriggered` event after each rule execution. - files: crates/foundry-cli/src/main.rs - run: cargo test
 16. [x] Implement the code within `crates/foundry-cli/src/main.rs` to call the graph recording mechanism with the rule node ID and result upon completion of checking rules. - files: crates/foundry-cli/src/main.rs - run: cargo test
 17. [x] Update the assertion logic within `crates/foundry-core/src/rules.rs` to verify that the newly recorded events are present in the graph history. - files: crates/foundry-core/src/rules.rs - run: cargo test
+18. [ ] Snapshot create checkpoints the SQLite WAL before copying so a snapshot contains every committed transaction, including ones not yet checkpointed into the main database file - files: crates/foundry-cli/src/main.rs - run: cargo test -p foundry-cli
