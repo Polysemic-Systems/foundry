@@ -264,6 +264,8 @@ pub enum GraphError {
     UnknownMigration { version: i64 },
     #[error("corrupt stored event: {detail}")]
     CorruptStoredEvent { detail: String },
+    #[error("lost the race transitioning {key}: it no longer holds state {expected}")]
+    StaleTransition { key: String, expected: String },
     #[error("unknown edge kind stored in database: {kind}")]
     UnknownEdgeKind { kind: String },
 }
@@ -657,11 +659,36 @@ impl Graph {
         let current = self
             .task_state(task_key)?
             .ok_or_else(|| GraphError::Sqlite(rusqlite::Error::QueryReturnedNoRows))?;
+        self.transition_task_from(task_key, current, next)
+    }
+
+    /// The write half of a task transition, conditional on the state the
+    /// caller validated against. Optimistic concurrency: the update lands
+    /// only if the row still holds that state, so a concurrent operator who
+    /// got there first surfaces as a lost race, never a double claim.
+    fn transition_task_from(
+        &mut self,
+        task_key: &str,
+        current: TaskState,
+        next: TaskState,
+    ) -> Result<TaskState, GraphError> {
         let next = current.transition(next)?;
-        self.conn.execute(
-            "UPDATE task_states SET state = ?1, updated_at = ?2 WHERE task_key = ?3",
-            params![next.as_str(), Utc::now().to_rfc3339(), task_key],
+        let updated = self.conn.execute(
+            "UPDATE task_states SET state = ?1, updated_at = ?2
+             WHERE task_key = ?3 AND state = ?4",
+            params![
+                next.as_str(),
+                Utc::now().to_rfc3339(),
+                task_key,
+                current.as_str()
+            ],
         )?;
+        if updated == 0 {
+            return Err(GraphError::StaleTransition {
+                key: task_key.to_string(),
+                expected: current.as_str().to_string(),
+            });
+        }
         Ok(next)
     }
 
@@ -704,11 +731,33 @@ impl Graph {
             |row| row.get(0),
         )?;
         let current = parse_job_state_value(&current)?;
+        self.transition_job_from(id, current, next)
+    }
+
+    /// Same optimistic guard as `transition_task_from`: no lost update can
+    /// silently overwrite a concurrent operator's claim.
+    fn transition_job_from(
+        &mut self,
+        id: JobId,
+        current: JobState,
+        next: JobState,
+    ) -> Result<JobState, GraphError> {
         let next = current.transition(next)?;
-        self.conn.execute(
-            "UPDATE jobs SET state = ?1, updated_at = ?2 WHERE id = ?3",
-            params![next.as_str(), Utc::now().to_rfc3339(), id.0.to_string()],
+        let updated = self.conn.execute(
+            "UPDATE jobs SET state = ?1, updated_at = ?2 WHERE id = ?3 AND state = ?4",
+            params![
+                next.as_str(),
+                Utc::now().to_rfc3339(),
+                id.0.to_string(),
+                current.as_str()
+            ],
         )?;
+        if updated == 0 {
+            return Err(GraphError::StaleTransition {
+                key: id.0.to_string(),
+                expected: current.as_str().to_string(),
+            });
+        }
         Ok(next)
     }
 
@@ -2497,6 +2546,30 @@ mod tests {
                 .filter(|report| report.version != 2 && report.version != 9999)
                 .all(|report| report.status == MigrationChecksumStatus::Verified)
         );
+    }
+
+    #[test]
+    fn lost_transition_races_surface_instead_of_double_claiming() {
+        let mut graph = Graph::open_in_memory().unwrap();
+        graph
+            .initialize_task_state("task-a", TaskState::Ready)
+            .unwrap();
+        // Simulate the loser of a read-validate-write race: the row moved
+        // to Running after this operator's validation read said Ready.
+        // Ready -> Running is a legal edge, but the conditional update must
+        // refuse rather than overwrite the winner's claim.
+        graph.transition_task("task-a", TaskState::Running).unwrap();
+        let err = graph
+            .transition_task_from("task-a", TaskState::Ready, TaskState::Running)
+            .expect_err("lost race must surface");
+        assert!(matches!(err, GraphError::StaleTransition { .. }), "{err}");
+
+        let job = graph.create_job("task-a", "race-1").unwrap();
+        graph.transition_job(job.id, JobState::Running).unwrap();
+        let err = graph
+            .transition_job_from(job.id, JobState::Queued, JobState::Running)
+            .expect_err("lost job race must surface");
+        assert!(matches!(err, GraphError::StaleTransition { .. }), "{err}");
     }
 
     #[test]
