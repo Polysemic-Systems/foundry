@@ -10,6 +10,31 @@ dependencies: building Foundry requires the `polysemic/` checkout next to
 `foundry/`. Digest is Foundry's model-output boundary (named repairs,
 ambiguity as questions); Lethe is its evidence-erasure contract.
 
+## Status: what is real and what is not yet
+
+Naming assumptions is the house rule, so it applies to this README too.
+
+**Working and tested end-to-end:** the plan → sandboxed job → immutable
+evidence → human review → journaled promotion vertical slice; the
+test-first editor-agent loop with red/green policy enforcement; the
+two-draft Socratic review TUI; checksum-verified migrations with a
+doctor-side audit; the digest model boundary (repair ledgers, ambiguity
+as answerable questions, recorded events); the lethe retention sweep
+(governed deletion, shared-blob reference counting, erasure receipts).
+
+**Present but not yet what the vocabulary promises:** events are an
+append-only audit log, not a communication bus — there is no dispatcher
+and no replay-from-events path; plan task dependencies are parsed but
+never populated, so plans execute as ordered lists, not DAGs; semantic
+search is a full-table scan over JSON-encoded embeddings (sqlite-vec is
+the plan); task/job state transitions assume a single operator — there
+is no cross-process guard against two concurrent `iterate` runs; test
+coverage is thinnest exactly where risk is highest (evidence-store
+hardening, Podman runner timeout/cancel paths).
+
+This is a working skeleton with unusually strict gates, not a product.
+The seams where you would extend it are marked in doc comments.
+
 ## Quick start
 
 ```bash
@@ -87,7 +112,7 @@ state. Only the final edited and attributable human resolution has authority:
 
 ```bash
 export FOUNDRY_REVIEW_AGENT_COMMAND='kimi --prompt'
-just review-tui 'plans/features.plan.md#task-4' <job-uuid> megloff1
+just review-tui 'plans/features.plan.md#task-4' <job-uuid> <reviewer-identity>
 ```
 
 If that job already has a human review, the same command opens a retrospective
