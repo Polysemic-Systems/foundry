@@ -34,6 +34,26 @@ pub struct JobResultRow {
     pub parsed: Result<JobResult, String>,
 }
 
+/// Outcome of re-verifying one stored migration checksum against the
+/// canonical registry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MigrationChecksumStatus {
+    /// Stored checksum equals the canonical SHA-256 of the registry SQL.
+    Verified,
+    /// Stored checksum disagrees with the canonical registry — the row or
+    /// the registry was altered after application.
+    Mismatch { stored: String },
+    /// The version is not in this binary's registry (database written by a
+    /// newer build, or a fabricated row).
+    UnknownVersion,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MigrationChecksumReport {
+    pub version: i64,
+    pub status: MigrationChecksumStatus,
+}
+
 /// Collect `sha256:<64 hex>` tokens from raw text into `digests`.
 fn scan_sha256_tokens(raw: &str, digests: &mut BTreeSet<String>) {
     let mut remainder = raw;
@@ -430,6 +450,29 @@ impl Graph {
             })
             .unwrap_or(0);
         Ok(version)
+    }
+
+    /// Re-verify every stored migration checksum against the canonical
+    /// registry. `migrate` validates on write; this is the read-side audit
+    /// for `doctor`, catching tampered rows and databases written by a newer
+    /// binary whose migrations this build does not know.
+    pub fn verify_migration_checksums(&self) -> Result<Vec<MigrationChecksumReport>, GraphError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT version, checksum FROM schema_migrations ORDER BY version")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
+        rows.map(|row| {
+            let (version, stored) = row?;
+            let status = match crate::migration_registry::checksum_for(version) {
+                None => MigrationChecksumStatus::UnknownVersion,
+                Some(canonical) if canonical == stored => MigrationChecksumStatus::Verified,
+                Some(_) => MigrationChecksumStatus::Mismatch { stored },
+            };
+            Ok(MigrationChecksumReport { version, status })
+        })
+        .collect()
     }
 
     pub fn events(&self, limit: usize) -> Result<Vec<(DateTime<Utc>, Event)>, GraphError> {
@@ -2362,6 +2405,52 @@ mod tests {
             graph.record_job_result(&mismatched),
             Err(GraphError::ResultStateMismatch)
         ));
+    }
+
+    #[test]
+    fn verify_migration_checksums_detects_tampered_and_unknown_rows() {
+        let graph = Graph::open_in_memory().unwrap();
+        let clean = graph.verify_migration_checksums().unwrap();
+        assert_eq!(clean.len() as i64, LATEST_SCHEMA_VERSION);
+        assert!(
+            clean
+                .iter()
+                .all(|report| report.status == MigrationChecksumStatus::Verified)
+        );
+
+        graph
+            .conn
+            .execute(
+                "UPDATE schema_migrations SET checksum = ?1 WHERE version = 2",
+                params!["0".repeat(64)],
+            )
+            .unwrap();
+        graph
+            .conn
+            .execute(
+                "INSERT INTO schema_migrations (version, checksum, applied_at)
+                 VALUES (9999, ?1, '2026-01-01T00:00:00Z')",
+                params!["1".repeat(64)],
+            )
+            .unwrap();
+
+        let audited = graph.verify_migration_checksums().unwrap();
+        let tampered = audited.iter().find(|report| report.version == 2).unwrap();
+        assert!(matches!(
+            tampered.status,
+            MigrationChecksumStatus::Mismatch { .. }
+        ));
+        let unknown = audited
+            .iter()
+            .find(|report| report.version == 9999)
+            .unwrap();
+        assert_eq!(unknown.status, MigrationChecksumStatus::UnknownVersion);
+        assert!(
+            audited
+                .iter()
+                .filter(|report| report.version != 2 && report.version != 9999)
+                .all(|report| report.status == MigrationChecksumStatus::Verified)
+        );
     }
 
     #[test]

@@ -1660,7 +1660,47 @@ fn cmd_doctor(root: &Path, db: &Path, plan_path: &Path) -> Result<()> {
         Err(e) => checks.push(fail("schema_version", format!("cannot read: {}", e))),
     }
 
-    // 4. Graph in sync with filesystem.
+    // 4. Stored migration checksums still match the canonical registry.
+    match graph.verify_migration_checksums() {
+        Ok(reports) => {
+            let mismatches: Vec<String> = reports
+                .iter()
+                .filter_map(|report| match &report.status {
+                    foundry_core::MigrationChecksumStatus::Mismatch { stored } => Some(format!(
+                        "version {} stored checksum {} does not match the canonical registry",
+                        report.version, stored
+                    )),
+                    _ => None,
+                })
+                .collect();
+            let unknown: Vec<i64> = reports
+                .iter()
+                .filter(|report| {
+                    report.status == foundry_core::MigrationChecksumStatus::UnknownVersion
+                })
+                .map(|report| report.version)
+                .collect();
+            if !mismatches.is_empty() {
+                checks.push(fail("migration_checksums", mismatches.join("; ")));
+            } else if !unknown.is_empty() {
+                checks.push(warn(
+                    "migration_checksums",
+                    format!(
+                        "versions {:?} are not in this binary's registry (newer database?)",
+                        unknown
+                    ),
+                ));
+            } else {
+                checks.push(ok(
+                    "migration_checksums",
+                    format!("{} migration checksum(s) verified", reports.len()),
+                ));
+            }
+        }
+        Err(e) => checks.push(fail("migration_checksums", format!("cannot verify: {}", e))),
+    }
+
+    // 5. Graph in sync with filesystem.
     match reconcile_state(root, db) {
         Ok((true, _, _)) => checks.push(ok("filesystem_sync", "graph and filesystem in sync")),
         Ok((false, missing, extra)) => {
@@ -1674,7 +1714,7 @@ fn cmd_doctor(root: &Path, db: &Path, plan_path: &Path) -> Result<()> {
         Err(e) => checks.push(fail("filesystem_sync", format!("cannot reconcile: {}", e))),
     }
 
-    // 5. Plan parseable.
+    // 6. Plan parseable.
     match fs::read_to_string(plan_path) {
         Ok(text) => match Plan::parse("bootstrap", &text).first_undone() {
             Some(task) if task.stop.is_some() => checks.push(warn(
@@ -1690,14 +1730,14 @@ fn cmd_doctor(root: &Path, db: &Path, plan_path: &Path) -> Result<()> {
         Err(e) => checks.push(fail("plan_state", format!("cannot read plan: {}", e))),
     }
 
-    // 6. Events recorded.
+    // 7. Events recorded.
     match graph.events(1) {
         Ok(events) if !events.is_empty() => checks.push(ok("events", "events table has rows")),
         Ok(_) => checks.push(warn("events", "events table is empty")),
         Err(e) => checks.push(fail("events", format!("cannot read events: {}", e))),
     }
 
-    // 7. Required tools on PATH.
+    // 8. Required tools on PATH.
     for tool in ["cargo", "just", "bwrap"] {
         if Command::new(tool).arg("--version").output().is_ok() {
             checks.push(ok(format!("tool_{}", tool), "found on PATH"));
@@ -1705,7 +1745,7 @@ fn cmd_doctor(root: &Path, db: &Path, plan_path: &Path) -> Result<()> {
             checks.push(fail(format!("tool_{}", tool), "not found on PATH"));
         }
     }
-    // 8. Optional local-model / network / sandbox tools.
+    // 9. Optional local-model / network / sandbox tools.
     for tool in ["ollama", "curl", "podman"] {
         if Command::new(tool).arg("--version").output().is_ok() {
             checks.push(ok(format!("tool_{}", tool), "found on PATH"));

@@ -23,7 +23,10 @@ pub mod migration_storage;
 pub use discourse::{DiscourseAct, DiscourseSpeaker, DiscourseTurn};
 pub use embed::{cosine_similarity, normalize};
 pub use event::{AnswerRecord, Event, QuestionRecord, RepairRecord, RuleResult};
-pub use graph::{Edge, EdgeKind, Graph, JobResultRow, Node, NodeKind};
+pub use graph::{
+    Edge, EdgeKind, Graph, JobResultRow, MigrationChecksumReport, MigrationChecksumStatus, Node,
+    NodeKind,
+};
 pub use job::{
     Artifact, ChangeSet, ChangeStatus, ChangedFile, FileEvidence, Job, JobContractError, JobId,
     JobResult, JobSpec, JobState, Review, ReviewDecision, StateParseError, TaskState, TestResult,
