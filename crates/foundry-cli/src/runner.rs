@@ -14,6 +14,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 use walkdir::WalkDir;
 
+/// Maximum bytes captured from a job's stdout/stderr before truncation.
+const MAX_CAPTURE_BYTES: usize = 10 * 1024 * 1024;
+
 /// Content-complete evidence for every relevant regular file in a workspace.
 pub type WorkspaceSnapshot = BTreeMap<String, FileEvidence>;
 
@@ -53,8 +56,8 @@ pub fn run_podman(
 
     let stdout = child.stdout.take().context("capturing job stdout")?;
     let stderr = child.stderr.take().context("capturing job stderr")?;
-    let stdout_reader = thread::spawn(move || read_all(stdout));
-    let stderr_reader = thread::spawn(move || read_all(stderr));
+    let stdout_reader = thread::spawn(move || read_all_limited(stdout, MAX_CAPTURE_BYTES));
+    let stderr_reader = thread::spawn(move || read_all_limited(stderr, MAX_CAPTURE_BYTES));
     let timeout = Duration::from_secs(spec.timeout_seconds);
     let mut timed_out = false;
     let mut was_cancelled = false;
@@ -306,10 +309,64 @@ pub fn sha256_digest(bytes: &[u8]) -> String {
     format!("sha256:{:x}", Sha256::digest(bytes))
 }
 
-fn read_all(mut reader: impl Read) -> Result<String> {
-    let mut bytes = Vec::new();
-    reader.read_to_end(&mut bytes)?;
-    Ok(String::from_utf8_lossy(&bytes).into_owned())
+fn read_all_limited(mut reader: impl Read, limit: usize) -> Result<String> {
+    const CHUNK: usize = 8192;
+    let mut kept = Vec::with_capacity(limit.min(CHUNK));
+    let mut total: usize = 0;
+    let mut buf = [0u8; CHUNK];
+
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        total += n;
+        if kept.len() < limit {
+            let take = n.min(limit - kept.len());
+            kept.extend_from_slice(&buf[..take]);
+        }
+    }
+
+    if total > limit {
+        let prefix_end = truncate_to_char_boundary(&kept, limit);
+        let dropped = total - prefix_end;
+        let mut result = String::with_capacity(prefix_end + 32);
+        result.push_str(&String::from_utf8_lossy(&kept[..prefix_end]));
+        result.push_str(&format!("[output truncated; {dropped} bytes dropped]\n"));
+        Ok(result)
+    } else {
+        Ok(String::from_utf8_lossy(&kept).into_owned())
+    }
+}
+
+fn truncate_to_char_boundary(bytes: &[u8], limit: usize) -> usize {
+    let mut end = bytes.len().min(limit);
+    while end > 0 {
+        let start = utf8_char_start(bytes, end - 1);
+        let expected = utf8_char_len(bytes[start]);
+        if end - start == expected {
+            return end;
+        }
+        end = start;
+    }
+    0
+}
+
+fn utf8_char_start(bytes: &[u8], mut idx: usize) -> usize {
+    while idx > 0 && (bytes[idx] & 0b1100_0000) == 0b1000_0000 {
+        idx -= 1;
+    }
+    idx
+}
+
+fn utf8_char_len(leading: u8) -> usize {
+    match leading.leading_ones() as usize {
+        0 => 1,
+        2 => 2,
+        3 => 3,
+        4 => 4,
+        _ => 1, // invalid leading byte; treat as single byte
+    }
 }
 
 #[cfg(test)]
@@ -424,5 +481,76 @@ mod tests {
         assert!(changes.base_revision.starts_with("sha256:"));
         assert!(changes.patch_digest.starts_with("sha256:"));
         fs::remove_dir_all(root).unwrap();
+    }
+
+    // Capture-limit tests for the runner's stdout/stderr readers.
+    // These exercise `read_all_limited` and `MAX_CAPTURE_BYTES`, which the
+    // implementation must add to prevent a runaway job from exhausting memory.
+
+    use std::io::Cursor;
+
+    fn parse_dropped_count(output: &str) -> Option<usize> {
+        let prefix = "[output truncated; ";
+        let idx = output.rfind(prefix)?;
+        let rest = &output[idx + prefix.len()..];
+        let end = rest.find(" bytes dropped]")?;
+        rest[..end].parse().ok()
+    }
+
+    #[test]
+    fn capture_stream_within_limit_is_unmodified() {
+        let input = "hello, world\n";
+        let output = read_all_limited(Cursor::new(input), 1024).unwrap();
+        assert_eq!(output, input);
+        assert!(
+            parse_dropped_count(&output).is_none(),
+            "streams under the limit must not carry a truncation marker"
+        );
+    }
+
+    #[test]
+    fn capture_stream_over_limit_appends_truncation_marker_with_dropped_count() {
+        let limit = 16;
+        let input = "x".repeat(100);
+        let output = read_all_limited(Cursor::new(&input), limit).unwrap();
+        assert_eq!(&output[..limit], "x".repeat(limit));
+        assert!(
+            output.len() > limit,
+            "a truncation marker must be appended after the kept prefix"
+        );
+        assert_eq!(
+            parse_dropped_count(&output),
+            Some(input.len() - limit),
+            "the marker must record the exact number of dropped bytes"
+        );
+        assert!(output.ends_with(" bytes dropped]\n"));
+    }
+
+    #[test]
+    fn capture_stream_truncation_respects_utf8_boundaries() {
+        // Each Greek letter is two UTF-8 bytes, for a total of 14 bytes.
+        let input = "αβγδεηθ";
+        let limit = 3; // falls in the middle of the second character (β)
+        let output = read_all_limited(Cursor::new(input), limit).unwrap();
+
+        let prefix_end = output.find("[output truncated; ").unwrap_or(output.len());
+        assert!(
+            input.is_char_boundary(prefix_end),
+            "truncation must not split a UTF-8 codepoint"
+        );
+        assert_eq!(&output[..prefix_end], "α");
+        assert_eq!(
+            parse_dropped_count(&output),
+            Some(input.len() - prefix_end),
+            "dropped count must reflect the actual kept bytes"
+        );
+    }
+
+    #[test]
+    fn default_capture_limit_is_a_reasonable_positive_size() {
+        assert!(
+            MAX_CAPTURE_BYTES > 0,
+            "the runner must define a named, non-zero byte limit"
+        );
     }
 }
