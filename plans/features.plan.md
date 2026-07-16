@@ -8,3 +8,12 @@
 6. [x] Modify the process that registers applied migrations to persist and associate the calculated checksum with the schema_migrations table entries - files: crates/foundry-core/src/migration_storage.rs, crates/foundry-core/src/db/schema.rs, crates/foundry-core/src/graph.rs
 7. [x] Implement a verification function within the doctor logic to retrieve stored checksums for historical migrations and compare them against the current canonical registry - files: crates/foundry-core/src/graph.rs, crates/foundry-core/src/migration_registry.rs, crates/foundry-cli/src/main.rs
 8. [x] Add test cases to validate successful checksum storage, tampered data detection, and handling of unknown versions during migration application simulation - run: cargo test
+9. [ ] Update `crates/foundry-core/src/graph.rs` to define necessary `GraphError` variants and modify the `events()` method to propagate decoding and timestamp errors instead of panicking. - files: crates/foundry-core/src/graph.rs
+10. [ ] Add a unit test inside `crates/foundry-core/src/graph.rs` under `#[cfg(test)]` that asserts processing an event row with undecodable data or invalid timestamps correctly returns a `GraphError`. This test must verify against the panic behavior. - files: crates/foundry-core/src/graph.rs
+11. [ ] Modify transition_task to implement a conditional update check based on the current state. - files: crates/foundry-core/src/graph.rs
+12. [ ] Modify transition_job to implement a conditional update check based on the current state. - files: crates/foundry-core/src/graph.rs
+13. [ ] Define and incorporate the specific error variant (e.g., StaleTransition or lost-race) into the GraphError enum for use in transitions. - files: crates/foundry-core/src/graph.rs
+14. [ ] Implement regression tests under `cfg(test)` that simulate concurrent, mismatched state reads to verify the error handling path. - run: cargo test
+15. [ ] Modify `crates/foundry-cli/src/main.rs` to obtain a mutable graph handle and integrate the logic for emitting a `RuleTriggered` event after each rule execution. - files: crates/foundry-cli/src/main.rs - run: cargo test
+16. [ ] Implement the code within `crates/foundry-cli/src/main.rs` to call the graph recording mechanism with the rule node ID and result upon completion of checking rules. - files: crates/foundry-cli/src/main.rs - run: cargo test
+17. [ ] Update the assertion logic within `crates/foundry-core/src/rules.rs` to verify that the newly recorded events are present in the graph history. - files: crates/foundry-core/src/rules.rs - run: cargo test
