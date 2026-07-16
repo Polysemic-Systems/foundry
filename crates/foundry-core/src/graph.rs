@@ -2,6 +2,7 @@ use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::BTreeSet;
 use std::path::Path;
 use thiserror::Error;
 use uuid::Uuid;
@@ -17,6 +18,58 @@ use crate::{
 };
 
 pub const LATEST_SCHEMA_VERSION: i64 = 7;
+
+/// One raw `job_results` row, deserialized but never hydrated: hydration
+/// fails closed on missing blobs, and enumeration must survive corrupt rows.
+#[derive(Debug)]
+pub struct JobResultRow {
+    /// Raw column text; may not be a valid uuid in corrupt history.
+    pub job_id: String,
+    /// Stable task key from the owning job, when that join still resolves.
+    pub task_key: Option<String>,
+    pub created_at: String,
+    /// The stored JSON exactly as persisted.
+    pub raw: String,
+    /// Deserialization outcome; an error is data for quarantine, not a crash.
+    pub parsed: Result<JobResult, String>,
+}
+
+/// Outcome of re-verifying one stored migration checksum against the
+/// canonical registry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MigrationChecksumStatus {
+    /// Stored checksum equals the canonical SHA-256 of the registry SQL.
+    Verified,
+    /// Stored checksum disagrees with the canonical registry — the row or
+    /// the registry was altered after application.
+    Mismatch { stored: String },
+    /// The version is not in this binary's registry (database written by a
+    /// newer build, or a fabricated row).
+    UnknownVersion,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MigrationChecksumReport {
+    pub version: i64,
+    pub status: MigrationChecksumStatus,
+}
+
+/// Collect `sha256:<64 hex>` tokens from raw text into `digests`.
+fn scan_sha256_tokens(raw: &str, digests: &mut BTreeSet<String>) {
+    let mut remainder = raw;
+    while let Some(position) = remainder.find("sha256:") {
+        let candidate = &remainder[position + "sha256:".len()..];
+        let hex: String = candidate
+            .chars()
+            .take_while(|character| character.is_ascii_hexdigit())
+            .take(64)
+            .collect();
+        if hex.len() == 64 {
+            digests.insert(format!("sha256:{hex}"));
+        }
+        remainder = &remainder[position + "sha256:".len()..];
+    }
+}
 
 /// A unique node identifier in the production graph.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -209,6 +262,12 @@ pub enum GraphError {
     ChecksumMismatch { version: i64 },
     #[error("unknown migration version {version} with no known migration content")]
     UnknownMigration { version: i64 },
+    #[error("corrupt stored event: {detail}")]
+    CorruptStoredEvent { detail: String },
+    #[error("lost the race transitioning {key}: it no longer holds state {expected}")]
+    StaleTransition { key: String, expected: String },
+    #[error("unknown edge kind stored in database: {kind}")]
+    UnknownEdgeKind { kind: String },
 }
 
 #[derive(Debug)]
@@ -355,7 +414,7 @@ impl Graph {
     }
 
     fn emit_event(&mut self, event: &Event) -> Result<(), GraphError> {
-        let payload = serde_json::to_string(event).expect("event serializes");
+        let payload = serde_json::to_string(event)?;
         self.conn.execute(
             "INSERT INTO events (id, kind, payload, created_at)
              VALUES (?1, ?2, ?3, ?4)",
@@ -399,21 +458,54 @@ impl Graph {
         Ok(version)
     }
 
+    /// Re-verify every stored migration checksum against the canonical
+    /// registry. `migrate` validates on write; this is the read-side audit
+    /// for `doctor`, catching tampered rows and databases written by a newer
+    /// binary whose migrations this build does not know.
+    pub fn verify_migration_checksums(&self) -> Result<Vec<MigrationChecksumReport>, GraphError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT version, checksum FROM schema_migrations ORDER BY version")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
+        rows.map(|row| {
+            let (version, stored) = row?;
+            let status = match crate::migration_registry::checksum_for(version) {
+                None => MigrationChecksumStatus::UnknownVersion,
+                Some(canonical) if canonical == stored => MigrationChecksumStatus::Verified,
+                Some(_) => MigrationChecksumStatus::Mismatch { stored },
+            };
+            Ok(MigrationChecksumReport { version, status })
+        })
+        .collect()
+    }
+
+    /// One corrupt row must surface as an error a caller can route, not a
+    /// panic that takes down `doctor` — the tool you would reach for when a
+    /// row is corrupt. Rows written by a newer binary (unknown event kinds)
+    /// fail the same recoverable way.
     pub fn events(&self, limit: usize) -> Result<Vec<(DateTime<Utc>, Event)>, GraphError> {
         let mut stmt = self
             .conn
             .prepare("SELECT payload, created_at FROM events ORDER BY created_at DESC LIMIT ?1")?;
         let rows = stmt.query_map(params![limit as i64], |row| {
-            let payload: String = row.get(0)?;
-            let ts: String = row.get(1)?;
-            let event: Event = serde_json::from_str(&payload).expect("stored event is valid json");
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        rows.map(|row| {
+            let (payload, ts) = row?;
+            let event: Event =
+                serde_json::from_str(&payload).map_err(|error| GraphError::CorruptStoredEvent {
+                    detail: format!("undecodable payload: {error}"),
+                })?;
             let created_at = DateTime::parse_from_rfc3339(&ts)
-                .expect("valid timestamp")
+                .map_err(|error| GraphError::CorruptStoredEvent {
+                    detail: format!("invalid timestamp {ts:?}: {error}"),
+                })?
                 .with_timezone(&Utc);
             Ok((created_at, event))
-        })?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(GraphError::Sqlite)
+        })
+        .collect()
     }
 
     /// Append an immutable, reply-linked turn to a Socratic discourse.
@@ -567,11 +659,36 @@ impl Graph {
         let current = self
             .task_state(task_key)?
             .ok_or_else(|| GraphError::Sqlite(rusqlite::Error::QueryReturnedNoRows))?;
+        self.transition_task_from(task_key, current, next)
+    }
+
+    /// The write half of a task transition, conditional on the state the
+    /// caller validated against. Optimistic concurrency: the update lands
+    /// only if the row still holds that state, so a concurrent operator who
+    /// got there first surfaces as a lost race, never a double claim.
+    fn transition_task_from(
+        &mut self,
+        task_key: &str,
+        current: TaskState,
+        next: TaskState,
+    ) -> Result<TaskState, GraphError> {
         let next = current.transition(next)?;
-        self.conn.execute(
-            "UPDATE task_states SET state = ?1, updated_at = ?2 WHERE task_key = ?3",
-            params![next.as_str(), Utc::now().to_rfc3339(), task_key],
+        let updated = self.conn.execute(
+            "UPDATE task_states SET state = ?1, updated_at = ?2
+             WHERE task_key = ?3 AND state = ?4",
+            params![
+                next.as_str(),
+                Utc::now().to_rfc3339(),
+                task_key,
+                current.as_str()
+            ],
         )?;
+        if updated == 0 {
+            return Err(GraphError::StaleTransition {
+                key: task_key.to_string(),
+                expected: current.as_str().to_string(),
+            });
+        }
         Ok(next)
     }
 
@@ -614,11 +731,33 @@ impl Graph {
             |row| row.get(0),
         )?;
         let current = parse_job_state_value(&current)?;
+        self.transition_job_from(id, current, next)
+    }
+
+    /// Same optimistic guard as `transition_task_from`: no lost update can
+    /// silently overwrite a concurrent operator's claim.
+    fn transition_job_from(
+        &mut self,
+        id: JobId,
+        current: JobState,
+        next: JobState,
+    ) -> Result<JobState, GraphError> {
         let next = current.transition(next)?;
-        self.conn.execute(
-            "UPDATE jobs SET state = ?1, updated_at = ?2 WHERE id = ?3",
-            params![next.as_str(), Utc::now().to_rfc3339(), id.0.to_string()],
+        let updated = self.conn.execute(
+            "UPDATE jobs SET state = ?1, updated_at = ?2 WHERE id = ?3 AND state = ?4",
+            params![
+                next.as_str(),
+                Utc::now().to_rfc3339(),
+                id.0.to_string(),
+                current.as_str()
+            ],
         )?;
+        if updated == 0 {
+            return Err(GraphError::StaleTransition {
+                key: id.0.to_string(),
+                expected: current.as_str().to_string(),
+            });
+        }
         Ok(next)
     }
 
@@ -675,6 +814,96 @@ impl Graph {
             crate::evidence_store::hydrate_job_result(&self.conn, result).map_err(GraphError::from)
         })
         .collect()
+    }
+
+    /// Enumerate every stored job result without hydrating evidence blobs.
+    /// A malformed row is surfaced as `parsed: Err(..)` so a retention sweep
+    /// can quarantine it instead of crashing on corrupt history.
+    pub fn job_result_rows(&self) -> Result<Vec<JobResultRow>, GraphError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT r.job_id, j.task_key, r.created_at, r.result
+             FROM job_results r LEFT JOIN jobs j ON j.id = r.job_id
+             ORDER BY r.created_at",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?;
+        rows.map(|row| {
+            let (job_id, task_key, created_at, json) = row?;
+            let parsed =
+                serde_json::from_str::<JobResult>(&json).map_err(|error| error.to_string());
+            Ok(JobResultRow {
+                job_id,
+                task_key,
+                created_at,
+                raw: json,
+                parsed,
+            })
+        })
+        .collect()
+    }
+
+    pub fn job_result_exists(&self, id: JobId) -> Result<bool, GraphError> {
+        let found: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM job_results WHERE job_id = ?1",
+                params![id.0.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(found.is_some())
+    }
+
+    /// Delete one job's evidence payload. The `jobs`, `reviews`, and `events`
+    /// rows are append-only history and are never touched; only the governed
+    /// evidence is erased. Returns whether a row existed.
+    pub fn delete_job_result(&mut self, id: JobId) -> Result<bool, GraphError> {
+        let deleted = self.conn.execute(
+            "DELETE FROM job_results WHERE job_id = ?1",
+            params![id.0.to_string()],
+        )?;
+        Ok(deleted > 0)
+    }
+
+    /// Every blob digest referenced by any remaining job result. Valid rows
+    /// contribute their structural references; malformed rows are scanned for
+    /// `sha256:<64 hex>` tokens so corrupt history can never cause its blobs
+    /// to be treated as unreferenced (conservative-safe for garbage collection).
+    pub fn referenced_blob_digests(&self) -> Result<BTreeSet<String>, GraphError> {
+        let mut digests = BTreeSet::new();
+        for row in self.job_result_rows()? {
+            match &row.parsed {
+                Ok(result) => {
+                    if let Some(change_set) = &result.change_set {
+                        for change in &change_set.files {
+                            for evidence in [change.before.as_ref(), change.after.as_ref()]
+                                .into_iter()
+                                .flatten()
+                            {
+                                if let Some(blob) = &evidence.blob {
+                                    digests.insert(blob.clone());
+                                }
+                                digests.insert(evidence.digest.clone());
+                            }
+                        }
+                    }
+                }
+                Err(_) => scan_sha256_tokens(&row.raw, &mut digests),
+            }
+        }
+        Ok(digests)
+    }
+
+    /// Location of the content-addressed evidence store for file-backed
+    /// graphs; `None` for in-memory graphs, which keep evidence inline.
+    pub fn blob_store_root(&self) -> Result<Option<std::path::PathBuf>, GraphError> {
+        Ok(crate::evidence_store::store_root(&self.conn)?)
     }
 
     pub fn record_review(&mut self, review: &Review) -> Result<TaskState, GraphError> {
@@ -845,6 +1074,29 @@ impl Graph {
     /// Record the human-edited resolution. A pending review performs the
     /// authoritative transition; an already-reviewed job records retrospective
     /// learning without rewriting the historical decision or task state.
+    /// A review decision is actionable only when the job belongs to the
+    /// named task and that task is awaiting review. Callers must enforce
+    /// this before any side effect of the decision — promoting staged bytes
+    /// on the strength of an unvalidated task/job pair is a gate bypass.
+    pub fn validate_review_binding(&self, task_key: &str, job_id: JobId) -> Result<(), GraphError> {
+        let job_task: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT task_key FROM jobs WHERE id = ?1",
+                params![job_id.0.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match job_task {
+            Some(owner) if owner == task_key => {}
+            _ => return Err(GraphError::ResultStateMismatch),
+        }
+        if self.task_state(task_key)? != Some(TaskState::Review) {
+            return Err(GraphError::ResultStateMismatch);
+        }
+        Ok(())
+    }
+
     pub fn record_review_resolution(
         &mut self,
         resolution: &ReviewResolution,
@@ -1280,6 +1532,10 @@ impl Graph {
         let rows = stmt.query_map(params![id.0.to_string()], |row| {
             let node = Self::map_node(row)?;
             let edge_kind_str: String = row.get(5)?;
+            Ok((edge_kind_str, node))
+        })?;
+        rows.map(|row| {
+            let (edge_kind_str, node) = row?;
             let edge_kind = match edge_kind_str.as_str() {
                 "depends_on" => EdgeKind::DependsOn,
                 "implements" => EdgeKind::Implements,
@@ -1288,12 +1544,17 @@ impl Graph {
                 "deploys" => EdgeKind::Deploys,
                 "learns_from" => EdgeKind::LearnsFrom,
                 "contains" => EdgeKind::Contains,
-                _ => panic!("unknown edge kind in db: {}", edge_kind_str),
+                // A row written by a newer binary is an error to route,
+                // not a reason to crash the reader.
+                _ => {
+                    return Err(GraphError::UnknownEdgeKind {
+                        kind: edge_kind_str,
+                    });
+                }
             };
             Ok((edge_kind, node))
-        })?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(GraphError::Sqlite)
+        })
+        .collect()
     }
 
     /// Index a code file into the graph.
@@ -2239,6 +2500,305 @@ mod tests {
             graph.record_job_result(&mismatched),
             Err(GraphError::ResultStateMismatch)
         ));
+    }
+
+    #[test]
+    fn verify_migration_checksums_detects_tampered_and_unknown_rows() {
+        let graph = Graph::open_in_memory().unwrap();
+        let clean = graph.verify_migration_checksums().unwrap();
+        assert_eq!(clean.len() as i64, LATEST_SCHEMA_VERSION);
+        assert!(
+            clean
+                .iter()
+                .all(|report| report.status == MigrationChecksumStatus::Verified)
+        );
+
+        graph
+            .conn
+            .execute(
+                "UPDATE schema_migrations SET checksum = ?1 WHERE version = 2",
+                params!["0".repeat(64)],
+            )
+            .unwrap();
+        graph
+            .conn
+            .execute(
+                "INSERT INTO schema_migrations (version, checksum, applied_at)
+                 VALUES (9999, ?1, '2026-01-01T00:00:00Z')",
+                params!["1".repeat(64)],
+            )
+            .unwrap();
+
+        let audited = graph.verify_migration_checksums().unwrap();
+        let tampered = audited.iter().find(|report| report.version == 2).unwrap();
+        assert!(matches!(
+            tampered.status,
+            MigrationChecksumStatus::Mismatch { .. }
+        ));
+        let unknown = audited
+            .iter()
+            .find(|report| report.version == 9999)
+            .unwrap();
+        assert_eq!(unknown.status, MigrationChecksumStatus::UnknownVersion);
+        assert!(
+            audited
+                .iter()
+                .filter(|report| report.version != 2 && report.version != 9999)
+                .all(|report| report.status == MigrationChecksumStatus::Verified)
+        );
+    }
+
+    #[test]
+    fn lost_transition_races_surface_instead_of_double_claiming() {
+        let mut graph = Graph::open_in_memory().unwrap();
+        graph
+            .initialize_task_state("task-a", TaskState::Ready)
+            .unwrap();
+        // Simulate the loser of a read-validate-write race: the row moved
+        // to Running after this operator's validation read said Ready.
+        // Ready -> Running is a legal edge, but the conditional update must
+        // refuse rather than overwrite the winner's claim.
+        graph.transition_task("task-a", TaskState::Running).unwrap();
+        let err = graph
+            .transition_task_from("task-a", TaskState::Ready, TaskState::Running)
+            .expect_err("lost race must surface");
+        assert!(matches!(err, GraphError::StaleTransition { .. }), "{err}");
+
+        let job = graph.create_job("task-a", "race-1").unwrap();
+        graph.transition_job(job.id, JobState::Running).unwrap();
+        let err = graph
+            .transition_job_from(job.id, JobState::Queued, JobState::Running)
+            .expect_err("lost job race must surface");
+        assert!(matches!(err, GraphError::StaleTransition { .. }), "{err}");
+    }
+
+    #[test]
+    fn corrupt_stored_events_error_instead_of_panicking() {
+        let mut graph = Graph::open_in_memory().unwrap();
+        graph
+            .record_event(&Event::SnapshotCreated {
+                name: "clean".into(),
+                path: "s.sqlite".into(),
+            })
+            .unwrap();
+        assert_eq!(graph.events(10).unwrap().len(), 1);
+
+        // Undecodable payload: an error to route, never a crash.
+        graph
+            .conn
+            .execute(
+                "INSERT INTO events (id, kind, payload, created_at)
+                 VALUES (?1, 'broken', '{\"event\": tru', ?2)",
+                params![Uuid::new_v4().to_string(), Utc::now().to_rfc3339()],
+            )
+            .unwrap();
+        let err = graph.events(10).expect_err("corrupt row must surface");
+        assert!(
+            matches!(err, GraphError::CorruptStoredEvent { .. }),
+            "{err}"
+        );
+
+        // An event kind from a newer binary fails the same recoverable way.
+        graph
+            .conn
+            .execute(
+                "UPDATE events SET payload = '{\"event\":\"from_the_future\"}'
+                 WHERE kind = 'broken'",
+                [],
+            )
+            .unwrap();
+        let err = graph.events(10).expect_err("unknown kind must surface");
+        assert!(
+            matches!(err, GraphError::CorruptStoredEvent { .. }),
+            "{err}"
+        );
+
+        // A bad timestamp too.
+        graph
+            .conn
+            .execute(
+                "UPDATE events SET payload = '{\"event\":\"node_created\",\"node_id\":\"00000000-0000-0000-0000-000000000000\"}',
+                 created_at = 'not-a-time' WHERE kind = 'broken'",
+                [],
+            )
+            .unwrap();
+        let err = graph.events(10).expect_err("bad timestamp must surface");
+        assert!(
+            matches!(err, GraphError::CorruptStoredEvent { .. }),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn review_binding_refuses_mismatched_or_unreviewable_pairs() {
+        let mut graph = Graph::open_in_memory().unwrap();
+        graph
+            .initialize_task_state("task-a", TaskState::Ready)
+            .unwrap();
+        graph.transition_task("task-a", TaskState::Running).unwrap();
+        let job = graph.create_job("task-a", "binding-1").unwrap();
+        graph.transition_job(job.id, JobState::Running).unwrap();
+        graph.transition_job(job.id, JobState::Succeeded).unwrap();
+
+        // Task not yet in review: the decision is not actionable.
+        assert!(graph.validate_review_binding("task-a", job.id).is_err());
+        graph.transition_task("task-a", TaskState::Review).unwrap();
+        assert!(graph.validate_review_binding("task-a", job.id).is_ok());
+
+        // A job belonging to another task must never authorize promotion,
+        // whatever state the named task is in.
+        graph
+            .initialize_task_state("task-b", TaskState::Ready)
+            .unwrap();
+        graph.transition_task("task-b", TaskState::Running).unwrap();
+        graph.transition_task("task-b", TaskState::Review).unwrap();
+        assert!(graph.validate_review_binding("task-b", job.id).is_err());
+        // Unknown job: refused.
+        assert!(
+            graph
+                .validate_review_binding("task-a", JobId(Uuid::new_v4()))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn delete_job_result_erases_only_the_evidence_payload() {
+        let mut graph = Graph::open_in_memory().unwrap();
+        let job = graph.create_job("task-a", "delete-1").unwrap();
+        graph.transition_job(job.id, JobState::Running).unwrap();
+        graph.transition_job(job.id, JobState::Succeeded).unwrap();
+        graph
+            .record_job_result(
+                &JobResult::new(job.id, JobState::Succeeded, evidence_governance()).unwrap(),
+            )
+            .unwrap();
+        let events_before: i64 = graph
+            .conn
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+            .unwrap();
+
+        assert!(graph.job_result_exists(job.id).unwrap());
+        assert!(graph.delete_job_result(job.id).unwrap());
+        assert!(!graph.job_result_exists(job.id).unwrap());
+        assert!(graph.job_result(job.id).unwrap().is_none());
+        assert!(!graph.delete_job_result(job.id).unwrap());
+
+        let jobs_remaining: i64 = graph
+            .conn
+            .query_row("SELECT COUNT(*) FROM jobs", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(jobs_remaining, 1, "jobs are append-only history");
+        let events_after: i64 = graph
+            .conn
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            events_after, events_before,
+            "deletion emits no event itself"
+        );
+    }
+
+    #[test]
+    fn job_result_rows_quarantine_malformed_history_without_crashing() {
+        let mut graph = Graph::open_in_memory().unwrap();
+        let job = graph.create_job("task-a", "rows-1").unwrap();
+        graph.transition_job(job.id, JobState::Running).unwrap();
+        graph.transition_job(job.id, JobState::Succeeded).unwrap();
+        graph
+            .record_job_result(
+                &JobResult::new(job.id, JobState::Succeeded, evidence_governance()).unwrap(),
+            )
+            .unwrap();
+        let corrupt_job = graph.create_job("task-b", "rows-corrupt").unwrap();
+        graph
+            .transition_job(corrupt_job.id, JobState::Running)
+            .unwrap();
+        graph
+            .transition_job(corrupt_job.id, JobState::Failed)
+            .unwrap();
+        graph
+            .conn
+            .execute(
+                "INSERT INTO job_results (job_id, result, created_at)
+                 VALUES (?1, '{\"corrupt\": tru', '2026-01-01T00:00:00Z')",
+                params![corrupt_job.id.0.to_string()],
+            )
+            .unwrap();
+
+        let rows = graph.job_result_rows().unwrap();
+        assert_eq!(rows.len(), 2);
+        let valid = rows.iter().find(|row| row.parsed.is_ok()).unwrap();
+        assert_eq!(valid.task_key.as_deref(), Some("task-a"));
+        let corrupt = rows.iter().find(|row| row.parsed.is_err()).unwrap();
+        assert_eq!(corrupt.job_id, corrupt_job.id.0.to_string());
+        assert_eq!(corrupt.task_key.as_deref(), Some("task-b"));
+    }
+
+    #[test]
+    fn referenced_blob_digests_include_malformed_rows_conservatively() {
+        let mut graph = Graph::open_in_memory().unwrap();
+        let job = graph.create_job("task-a", "digests-1").unwrap();
+        graph.transition_job(job.id, JobState::Running).unwrap();
+        graph.transition_job(job.id, JobState::Succeeded).unwrap();
+        let structural = format!("sha256:{}", "1".repeat(64));
+        let mut result =
+            JobResult::new(job.id, JobState::Succeeded, evidence_governance()).unwrap();
+        result.change_set = Some(crate::ChangeSet {
+            base_revision: "sha256:base".into(),
+            patch_digest: "sha256:patch".into(),
+            files: vec![crate::ChangedFile {
+                path: "a.txt".into(),
+                status: crate::ChangeStatus::Added,
+                before: None,
+                after: Some(crate::FileEvidence {
+                    digest: structural.clone(),
+                    bytes: b"a".to_vec(),
+                    blob: None,
+                    executable: false,
+                }),
+            }],
+        });
+        graph.record_job_result(&result).unwrap();
+        let scanned = format!("sha256:{}", "a".repeat(64));
+        let corrupt_job = graph.create_job("task-b", "digests-corrupt").unwrap();
+        graph
+            .transition_job(corrupt_job.id, JobState::Running)
+            .unwrap();
+        graph
+            .transition_job(corrupt_job.id, JobState::Failed)
+            .unwrap();
+        graph
+            .conn
+            .execute(
+                "INSERT INTO job_results (job_id, result, created_at)
+                 VALUES (?1, ?2, '2026-01-01T00:00:00Z')",
+                params![
+                    corrupt_job.id.0.to_string(),
+                    format!("{{\"broken\": \"{scanned}\"")
+                ],
+            )
+            .unwrap();
+
+        let digests = graph.referenced_blob_digests().unwrap();
+        assert!(digests.contains(&structural), "structural reference kept");
+        assert!(
+            digests.contains(&scanned),
+            "corrupt row's digests must never be treated as unreferenced"
+        );
+    }
+
+    #[test]
+    fn blob_store_root_is_only_present_for_file_backed_graphs() {
+        let graph = Graph::open_in_memory().unwrap();
+        assert!(graph.blob_store_root().unwrap().is_none());
+
+        let root = std::env::temp_dir().join(format!("foundry-blob-root-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let file_backed = Graph::open(&root.join("db.sqlite")).unwrap();
+        let store = file_backed.blob_store_root().unwrap().unwrap();
+        assert!(store.ends_with("blobs/sha256"));
+        drop(file_backed);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

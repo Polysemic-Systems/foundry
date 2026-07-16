@@ -51,7 +51,7 @@ pub fn hydrate_job_result(
     Ok(result)
 }
 
-fn store_root(conn: &Connection) -> Result<Option<PathBuf>, EvidenceStoreError> {
+pub(crate) fn store_root(conn: &Connection) -> Result<Option<PathBuf>, EvidenceStoreError> {
     let mut statement = conn.prepare("PRAGMA database_list")?;
     let rows = statement.query_map([], |row| {
         Ok((row.get::<_, String>(1)?, row.get::<_, String>(2)?))

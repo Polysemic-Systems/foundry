@@ -4,6 +4,37 @@ A local-first, self-building production system.
 
 > Code is the spec. The system builds itself.
 
+Foundry consumes the MIT-licensed `digest`, `lethe`, and `polysemic-core`
+crates from the sibling [polysemic](../polysemic/) workspace as path
+dependencies: building Foundry requires the `polysemic/` checkout next to
+`foundry/`. Digest is Foundry's model-output boundary (named repairs,
+ambiguity as questions); Lethe is its evidence-erasure contract.
+
+## Status: what is real and what is not yet
+
+Naming assumptions is the house rule, so it applies to this README too.
+
+**Working and tested end-to-end:** the plan → sandboxed job → immutable
+evidence → human review → journaled promotion vertical slice; the
+test-first editor-agent loop with red/green policy enforcement; the
+two-draft Socratic review TUI; checksum-verified migrations with a
+doctor-side audit; the digest model boundary (repair ledgers, ambiguity
+as answerable questions, recorded events); the lethe retention sweep
+(governed deletion, shared-blob reference counting, erasure receipts).
+
+**Present but not yet what the vocabulary promises:** events are an
+append-only audit log, not a communication bus — there is no dispatcher
+and no replay-from-events path; plan task dependencies are parsed but
+never populated, so plans execute as ordered lists, not DAGs; semantic
+search is a full-table scan over JSON-encoded embeddings (sqlite-vec is
+the plan); task/job state transitions assume a single operator — there
+is no cross-process guard against two concurrent `iterate` runs; test
+coverage is thinnest exactly where risk is highest (evidence-store
+hardening, Podman runner timeout/cancel paths).
+
+This is a working skeleton with unusually strict gates, not a product.
+The seams where you would extend it are marked in doc comments.
+
 ## Quick start
 
 ```bash
@@ -33,6 +64,45 @@ just iterate  # reflects the approval in the plan and selects the next task
 Use `review-reject` with the same arguments to return the task to `ready` for a
 new attempt. Reusing an idempotency key returns the original immutable result.
 
+### The digest boundary
+
+Every model-generated payload crosses the `digest` seam before Foundry trusts
+its shape. `foundry propose` asks the model for one JSON object
+(`{"spec": ..., "tasks": [...]}`); malformed output is repaired with every fix
+named on a printed ledger (stripped fences, requoted strings, Python literals,
+trailing commas, case-folded enums), and genuine ambiguity becomes questions
+the human can answer interactively instead of a silent guess. Review-draft
+agents must likewise emit `{"recommendation": "approve" | "reject", "body":
+"<Socratic markdown>"}`; the recommendation is schema-enforced and
+case-folded. Each crossing is recorded as a `model_output_digested` event with
+its repair, question, and answer ledgers.
+
+### Retention sweep
+
+Every job result carries a governed `RetentionPolicy`; `foundry sweep`
+enforces it. The default policy stays `ReviewAfter { now + 30 days }`; pass
+`--evidence-retention-days N` to `job-run` (or set
+`FOUNDRY_EVIDENCE_RETENTION_DAYS`) to opt a job's evidence into
+`DeleteAfter { now + N days }`.
+
+```bash
+foundry sweep            # dry-run report: delete-due, review-due, deferred, retained, quarantined
+foundry sweep --enforce  # erase delete-due evidence, collect orphaned blobs, record receipts
+```
+
+Enforcement runs through lethe's erasure contract: two stores (the SQLite
+`job_results` row and the content-addressed blob store) are erased and
+independently verified absent by an `ErasureCoordinator`; blobs shared with
+surviving results are kept by reference counting. Receipts are one-way
+commitments (`lethe://request/<hash>`, `foundry://erasure/<store>/sha256:<hash>`)
+recorded as `evidence_erased` and `retention_swept` events — counts and hashes,
+never content. The `jobs`, `reviews`, and `events` rows are append-only history
+and are never deleted. Delete-due evidence whose task sits in review is
+deferred: retention never removes evidence from under an open human decision.
+Malformed stored results are quarantined and reported, and their blobs are
+conservatively treated as referenced. Do not run `sweep --enforce` while jobs
+are actively executing (a one-hour age guard protects freshly written blobs).
+
 ### Evidence-grounded review TUI
 
 For successful jobs, Foundry prepares two structurally independent advisory
@@ -42,7 +112,7 @@ state. Only the final edited and attributable human resolution has authority:
 
 ```bash
 export FOUNDRY_REVIEW_AGENT_COMMAND='kimi --prompt'
-just review-tui 'plans/features.plan.md#task-4' <job-uuid> megloff1
+just review-tui 'plans/features.plan.md#task-4' <job-uuid> <reviewer-identity>
 ```
 
 If that job already has a human review, the same command opens a retrospective

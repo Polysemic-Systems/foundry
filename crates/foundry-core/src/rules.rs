@@ -156,6 +156,41 @@ mod tests {
     use crate::graph::{EdgeKind, Graph, Node, NodeKind};
 
     #[test]
+    fn rule_executions_become_graph_history() {
+        // The graph must learn its own health history: every rule execution
+        // is recorded as a RuleTriggered event tied to the rule's node.
+        let mut graph = Graph::open_in_memory().unwrap();
+        let rules = built_in_rules();
+        upsert_rules(&mut graph, &rules).unwrap();
+
+        for rule in &rules {
+            let result = rule.check(&graph).unwrap();
+            let node = graph
+                .find_node_by_name(NodeKind::Rule, rule.id())
+                .unwrap()
+                .expect("upserted rule has a node");
+            graph
+                .record_event(&crate::Event::RuleTriggered {
+                    rule_id: node.id,
+                    result,
+                })
+                .unwrap();
+        }
+
+        let triggered: Vec<_> = graph
+            .events(50)
+            .unwrap()
+            .into_iter()
+            .filter(|(_, event)| event.kind() == "rule_triggered")
+            .collect();
+        assert_eq!(
+            triggered.len(),
+            rules.len(),
+            "one RuleTriggered event per executed rule"
+        );
+    }
+
+    #[test]
     fn edge_integrity_passes_when_all_edges_are_valid() {
         let mut graph = Graph::open_in_memory().unwrap();
         let a = Node::new(NodeKind::Task, "a", serde_json::json!({"status": "open"}));

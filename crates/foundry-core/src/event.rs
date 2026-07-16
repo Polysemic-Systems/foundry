@@ -83,6 +83,60 @@ pub enum Event {
     SnapshotCreated { name: String, path: String },
     /// A database snapshot was restored.
     SnapshotRestored { name: String, path: String },
+    /// Raw model output crossed the digest boundary.
+    ModelOutputDigested {
+        context: String,
+        status: String,
+        repairs: Vec<RepairRecord>,
+        questions: Vec<QuestionRecord>,
+        answers: Vec<AnswerRecord>,
+    },
+    /// One job's evidence payload was erased under its governed retention
+    /// policy. The job uuid is a pointer into retained append-only history
+    /// (the `jobs` row survives), never a derivative of erased content.
+    EvidenceErased {
+        job_id: JobId,
+        request_id: String,
+        status: String,
+        receipt: String,
+        store_receipts: Vec<String>,
+    },
+    /// A retention sweep classified all governed evidence. Counts only.
+    RetentionSwept {
+        enforced: bool,
+        delete_due: usize,
+        deleted: usize,
+        deferred: usize,
+        review_due: usize,
+        retained: usize,
+        preserved: usize,
+        quarantined: usize,
+        orphan_blobs_removed: usize,
+    },
+}
+
+/// Serde mirror of a digest-boundary repair. Foundry-core stays free of the
+/// digest dependency; only the stable code and human wording are retained.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct RepairRecord {
+    pub code: String,
+    pub detail: String,
+}
+
+/// Serde mirror of a digest-boundary question raised for genuine ambiguity.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct QuestionRecord {
+    pub path: String,
+    pub prompt: String,
+    pub candidates: Vec<String>,
+}
+
+/// An applied clarification: an accountable human decision, kept separate
+/// from repairs exactly as the digest ledger keeps them separate.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct AnswerRecord {
+    pub path: String,
+    pub value: serde_json::Value,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -115,6 +169,69 @@ impl Event {
             Event::FeatureProposed { .. } => "feature_proposed",
             Event::SnapshotCreated { .. } => "snapshot_created",
             Event::SnapshotRestored { .. } => "snapshot_restored",
+            Event::ModelOutputDigested { .. } => "model_output_digested",
+            Event::EvidenceErased { .. } => "evidence_erased",
+            Event::RetentionSwept { .. } => "retention_swept",
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn model_output_digested_round_trips_with_stable_kind() {
+        let event = Event::ModelOutputDigested {
+            context: "proposal".into(),
+            status: "clarify".into(),
+            repairs: vec![RepairRecord {
+                code: "stripped_fence".into(),
+                detail: "stripped a markdown fence".into(),
+            }],
+            questions: vec![QuestionRecord {
+                path: "$.qty".into(),
+                prompt: "which quantity?".into(),
+                candidates: vec!["2".into(), "3".into()],
+            }],
+            answers: vec![AnswerRecord {
+                path: "$.qty".into(),
+                value: serde_json::json!(2),
+            }],
+        };
+        assert_eq!(event.kind(), "model_output_digested");
+        let json = serde_json::to_string(&event).expect("serializes");
+        assert!(json.contains("\"event\":\"model_output_digested\""));
+        let back: Event = serde_json::from_str(&json).expect("deserializes");
+        assert_eq!(back.kind(), event.kind());
+    }
+
+    #[test]
+    fn retention_events_round_trip_with_stable_kinds() {
+        let erased = Event::EvidenceErased {
+            job_id: JobId(uuid::Uuid::nil()),
+            request_id: "sweep-x".into(),
+            status: "complete".into(),
+            receipt: "lethe://request/0".into(),
+            store_receipts: vec!["job-results:erased:foundry://erasure/x".into()],
+        };
+        assert_eq!(erased.kind(), "evidence_erased");
+        let swept = Event::RetentionSwept {
+            enforced: true,
+            delete_due: 1,
+            deleted: 1,
+            deferred: 0,
+            review_due: 2,
+            retained: 3,
+            preserved: 1,
+            quarantined: 0,
+            orphan_blobs_removed: 0,
+        };
+        assert_eq!(swept.kind(), "retention_swept");
+        for event in [erased, swept] {
+            let json = serde_json::to_string(&event).expect("serializes");
+            let back: Event = serde_json::from_str(&json).expect("deserializes");
+            assert_eq!(back.kind(), event.kind());
         }
     }
 }
