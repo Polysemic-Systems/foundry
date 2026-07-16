@@ -262,6 +262,10 @@ pub enum GraphError {
     ChecksumMismatch { version: i64 },
     #[error("unknown migration version {version} with no known migration content")]
     UnknownMigration { version: i64 },
+    #[error("corrupt stored event: {detail}")]
+    CorruptStoredEvent { detail: String },
+    #[error("unknown edge kind stored in database: {kind}")]
+    UnknownEdgeKind { kind: String },
 }
 
 #[derive(Debug)]
@@ -408,7 +412,7 @@ impl Graph {
     }
 
     fn emit_event(&mut self, event: &Event) -> Result<(), GraphError> {
-        let payload = serde_json::to_string(event).expect("event serializes");
+        let payload = serde_json::to_string(event)?;
         self.conn.execute(
             "INSERT INTO events (id, kind, payload, created_at)
              VALUES (?1, ?2, ?3, ?4)",
@@ -475,21 +479,31 @@ impl Graph {
         .collect()
     }
 
+    /// One corrupt row must surface as an error a caller can route, not a
+    /// panic that takes down `doctor` — the tool you would reach for when a
+    /// row is corrupt. Rows written by a newer binary (unknown event kinds)
+    /// fail the same recoverable way.
     pub fn events(&self, limit: usize) -> Result<Vec<(DateTime<Utc>, Event)>, GraphError> {
         let mut stmt = self
             .conn
             .prepare("SELECT payload, created_at FROM events ORDER BY created_at DESC LIMIT ?1")?;
         let rows = stmt.query_map(params![limit as i64], |row| {
-            let payload: String = row.get(0)?;
-            let ts: String = row.get(1)?;
-            let event: Event = serde_json::from_str(&payload).expect("stored event is valid json");
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        rows.map(|row| {
+            let (payload, ts) = row?;
+            let event: Event =
+                serde_json::from_str(&payload).map_err(|error| GraphError::CorruptStoredEvent {
+                    detail: format!("undecodable payload: {error}"),
+                })?;
             let created_at = DateTime::parse_from_rfc3339(&ts)
-                .expect("valid timestamp")
+                .map_err(|error| GraphError::CorruptStoredEvent {
+                    detail: format!("invalid timestamp {ts:?}: {error}"),
+                })?
                 .with_timezone(&Utc);
             Ok((created_at, event))
-        })?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(GraphError::Sqlite)
+        })
+        .collect()
     }
 
     /// Append an immutable, reply-linked turn to a Socratic discourse.
@@ -1469,6 +1483,10 @@ impl Graph {
         let rows = stmt.query_map(params![id.0.to_string()], |row| {
             let node = Self::map_node(row)?;
             let edge_kind_str: String = row.get(5)?;
+            Ok((edge_kind_str, node))
+        })?;
+        rows.map(|row| {
+            let (edge_kind_str, node) = row?;
             let edge_kind = match edge_kind_str.as_str() {
                 "depends_on" => EdgeKind::DependsOn,
                 "implements" => EdgeKind::Implements,
@@ -1477,12 +1495,17 @@ impl Graph {
                 "deploys" => EdgeKind::Deploys,
                 "learns_from" => EdgeKind::LearnsFrom,
                 "contains" => EdgeKind::Contains,
-                _ => panic!("unknown edge kind in db: {}", edge_kind_str),
+                // A row written by a newer binary is an error to route,
+                // not a reason to crash the reader.
+                _ => {
+                    return Err(GraphError::UnknownEdgeKind {
+                        kind: edge_kind_str,
+                    });
+                }
             };
             Ok((edge_kind, node))
-        })?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(GraphError::Sqlite)
+        })
+        .collect()
     }
 
     /// Index a code file into the graph.
@@ -2473,6 +2496,63 @@ mod tests {
                 .iter()
                 .filter(|report| report.version != 2 && report.version != 9999)
                 .all(|report| report.status == MigrationChecksumStatus::Verified)
+        );
+    }
+
+    #[test]
+    fn corrupt_stored_events_error_instead_of_panicking() {
+        let mut graph = Graph::open_in_memory().unwrap();
+        graph
+            .record_event(&Event::SnapshotCreated {
+                name: "clean".into(),
+                path: "s.sqlite".into(),
+            })
+            .unwrap();
+        assert_eq!(graph.events(10).unwrap().len(), 1);
+
+        // Undecodable payload: an error to route, never a crash.
+        graph
+            .conn
+            .execute(
+                "INSERT INTO events (id, kind, payload, created_at)
+                 VALUES (?1, 'broken', '{\"event\": tru', ?2)",
+                params![Uuid::new_v4().to_string(), Utc::now().to_rfc3339()],
+            )
+            .unwrap();
+        let err = graph.events(10).expect_err("corrupt row must surface");
+        assert!(
+            matches!(err, GraphError::CorruptStoredEvent { .. }),
+            "{err}"
+        );
+
+        // An event kind from a newer binary fails the same recoverable way.
+        graph
+            .conn
+            .execute(
+                "UPDATE events SET payload = '{\"event\":\"from_the_future\"}'
+                 WHERE kind = 'broken'",
+                [],
+            )
+            .unwrap();
+        let err = graph.events(10).expect_err("unknown kind must surface");
+        assert!(
+            matches!(err, GraphError::CorruptStoredEvent { .. }),
+            "{err}"
+        );
+
+        // A bad timestamp too.
+        graph
+            .conn
+            .execute(
+                "UPDATE events SET payload = '{\"event\":\"node_created\",\"node_id\":\"00000000-0000-0000-0000-000000000000\"}',
+                 created_at = 'not-a-time' WHERE kind = 'broken'",
+                [],
+            )
+            .unwrap();
+        let err = graph.events(10).expect_err("bad timestamp must surface");
+        assert!(
+            matches!(err, GraphError::CorruptStoredEvent { .. }),
+            "{err}"
         );
     }
 
