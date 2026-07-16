@@ -1755,7 +1755,23 @@ fn cmd_doctor(root: &Path, db: &Path, plan_path: &Path) -> Result<()> {
         Err(e) => checks.push(fail("events", format!("cannot read events: {}", e))),
     }
 
-    // 8. Required tools on PATH.
+    // 8. Orphaned evidence old enough for the sweep to collect.
+    match sweep::orphaned_blob_count(&graph) {
+        Ok(0) => checks.push(ok(
+            "orphaned_evidence",
+            "no orphaned evidence blobs older than the sweep age guard",
+        )),
+        Ok(count) => checks.push(warn(
+            "orphaned_evidence",
+            format!("{count} orphaned evidence blob(s) older than the sweep age guard"),
+        )),
+        Err(e) => checks.push(fail(
+            "orphaned_evidence",
+            format!("cannot scan evidence blobs: {e}"),
+        )),
+    }
+
+    // 9. Required tools on PATH.
     for tool in ["cargo", "just", "bwrap"] {
         if Command::new(tool).arg("--version").output().is_ok() {
             checks.push(ok(format!("tool_{}", tool), "found on PATH"));
@@ -1763,7 +1779,7 @@ fn cmd_doctor(root: &Path, db: &Path, plan_path: &Path) -> Result<()> {
             checks.push(fail(format!("tool_{}", tool), "not found on PATH"));
         }
     }
-    // 9. Optional local-model / network / sandbox tools.
+    // 10. Optional local-model / network / sandbox tools.
     for tool in ["ollama", "curl", "podman"] {
         if Command::new(tool).arg("--version").output().is_ok() {
             checks.push(ok(format!("tool_{}", tool), "found on PATH"));
