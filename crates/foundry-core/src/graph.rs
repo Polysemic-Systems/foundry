@@ -2,6 +2,7 @@ use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::BTreeSet;
 use std::path::Path;
 use thiserror::Error;
 use uuid::Uuid;
@@ -17,6 +18,38 @@ use crate::{
 };
 
 pub const LATEST_SCHEMA_VERSION: i64 = 7;
+
+/// One raw `job_results` row, deserialized but never hydrated: hydration
+/// fails closed on missing blobs, and enumeration must survive corrupt rows.
+#[derive(Debug)]
+pub struct JobResultRow {
+    /// Raw column text; may not be a valid uuid in corrupt history.
+    pub job_id: String,
+    /// Stable task key from the owning job, when that join still resolves.
+    pub task_key: Option<String>,
+    pub created_at: String,
+    /// The stored JSON exactly as persisted.
+    pub raw: String,
+    /// Deserialization outcome; an error is data for quarantine, not a crash.
+    pub parsed: Result<JobResult, String>,
+}
+
+/// Collect `sha256:<64 hex>` tokens from raw text into `digests`.
+fn scan_sha256_tokens(raw: &str, digests: &mut BTreeSet<String>) {
+    let mut remainder = raw;
+    while let Some(position) = remainder.find("sha256:") {
+        let candidate = &remainder[position + "sha256:".len()..];
+        let hex: String = candidate
+            .chars()
+            .take_while(|character| character.is_ascii_hexdigit())
+            .take(64)
+            .collect();
+        if hex.len() == 64 {
+            digests.insert(format!("sha256:{hex}"));
+        }
+        remainder = &remainder[position + "sha256:".len()..];
+    }
+}
 
 /// A unique node identifier in the production graph.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -675,6 +708,96 @@ impl Graph {
             crate::evidence_store::hydrate_job_result(&self.conn, result).map_err(GraphError::from)
         })
         .collect()
+    }
+
+    /// Enumerate every stored job result without hydrating evidence blobs.
+    /// A malformed row is surfaced as `parsed: Err(..)` so a retention sweep
+    /// can quarantine it instead of crashing on corrupt history.
+    pub fn job_result_rows(&self) -> Result<Vec<JobResultRow>, GraphError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT r.job_id, j.task_key, r.created_at, r.result
+             FROM job_results r LEFT JOIN jobs j ON j.id = r.job_id
+             ORDER BY r.created_at",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?;
+        rows.map(|row| {
+            let (job_id, task_key, created_at, json) = row?;
+            let parsed =
+                serde_json::from_str::<JobResult>(&json).map_err(|error| error.to_string());
+            Ok(JobResultRow {
+                job_id,
+                task_key,
+                created_at,
+                raw: json,
+                parsed,
+            })
+        })
+        .collect()
+    }
+
+    pub fn job_result_exists(&self, id: JobId) -> Result<bool, GraphError> {
+        let found: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM job_results WHERE job_id = ?1",
+                params![id.0.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(found.is_some())
+    }
+
+    /// Delete one job's evidence payload. The `jobs`, `reviews`, and `events`
+    /// rows are append-only history and are never touched; only the governed
+    /// evidence is erased. Returns whether a row existed.
+    pub fn delete_job_result(&mut self, id: JobId) -> Result<bool, GraphError> {
+        let deleted = self.conn.execute(
+            "DELETE FROM job_results WHERE job_id = ?1",
+            params![id.0.to_string()],
+        )?;
+        Ok(deleted > 0)
+    }
+
+    /// Every blob digest referenced by any remaining job result. Valid rows
+    /// contribute their structural references; malformed rows are scanned for
+    /// `sha256:<64 hex>` tokens so corrupt history can never cause its blobs
+    /// to be treated as unreferenced (conservative-safe for garbage collection).
+    pub fn referenced_blob_digests(&self) -> Result<BTreeSet<String>, GraphError> {
+        let mut digests = BTreeSet::new();
+        for row in self.job_result_rows()? {
+            match &row.parsed {
+                Ok(result) => {
+                    if let Some(change_set) = &result.change_set {
+                        for change in &change_set.files {
+                            for evidence in [change.before.as_ref(), change.after.as_ref()]
+                                .into_iter()
+                                .flatten()
+                            {
+                                if let Some(blob) = &evidence.blob {
+                                    digests.insert(blob.clone());
+                                }
+                                digests.insert(evidence.digest.clone());
+                            }
+                        }
+                    }
+                }
+                Err(_) => scan_sha256_tokens(&row.raw, &mut digests),
+            }
+        }
+        Ok(digests)
+    }
+
+    /// Location of the content-addressed evidence store for file-backed
+    /// graphs; `None` for in-memory graphs, which keep evidence inline.
+    pub fn blob_store_root(&self) -> Result<Option<std::path::PathBuf>, GraphError> {
+        Ok(crate::evidence_store::store_root(&self.conn)?)
     }
 
     pub fn record_review(&mut self, review: &Review) -> Result<TaskState, GraphError> {
@@ -2239,6 +2362,146 @@ mod tests {
             graph.record_job_result(&mismatched),
             Err(GraphError::ResultStateMismatch)
         ));
+    }
+
+    #[test]
+    fn delete_job_result_erases_only_the_evidence_payload() {
+        let mut graph = Graph::open_in_memory().unwrap();
+        let job = graph.create_job("task-a", "delete-1").unwrap();
+        graph.transition_job(job.id, JobState::Running).unwrap();
+        graph.transition_job(job.id, JobState::Succeeded).unwrap();
+        graph
+            .record_job_result(
+                &JobResult::new(job.id, JobState::Succeeded, evidence_governance()).unwrap(),
+            )
+            .unwrap();
+        let events_before: i64 = graph
+            .conn
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+            .unwrap();
+
+        assert!(graph.job_result_exists(job.id).unwrap());
+        assert!(graph.delete_job_result(job.id).unwrap());
+        assert!(!graph.job_result_exists(job.id).unwrap());
+        assert!(graph.job_result(job.id).unwrap().is_none());
+        assert!(!graph.delete_job_result(job.id).unwrap());
+
+        let jobs_remaining: i64 = graph
+            .conn
+            .query_row("SELECT COUNT(*) FROM jobs", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(jobs_remaining, 1, "jobs are append-only history");
+        let events_after: i64 = graph
+            .conn
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            events_after, events_before,
+            "deletion emits no event itself"
+        );
+    }
+
+    #[test]
+    fn job_result_rows_quarantine_malformed_history_without_crashing() {
+        let mut graph = Graph::open_in_memory().unwrap();
+        let job = graph.create_job("task-a", "rows-1").unwrap();
+        graph.transition_job(job.id, JobState::Running).unwrap();
+        graph.transition_job(job.id, JobState::Succeeded).unwrap();
+        graph
+            .record_job_result(
+                &JobResult::new(job.id, JobState::Succeeded, evidence_governance()).unwrap(),
+            )
+            .unwrap();
+        let corrupt_job = graph.create_job("task-b", "rows-corrupt").unwrap();
+        graph
+            .transition_job(corrupt_job.id, JobState::Running)
+            .unwrap();
+        graph
+            .transition_job(corrupt_job.id, JobState::Failed)
+            .unwrap();
+        graph
+            .conn
+            .execute(
+                "INSERT INTO job_results (job_id, result, created_at)
+                 VALUES (?1, '{\"corrupt\": tru', '2026-01-01T00:00:00Z')",
+                params![corrupt_job.id.0.to_string()],
+            )
+            .unwrap();
+
+        let rows = graph.job_result_rows().unwrap();
+        assert_eq!(rows.len(), 2);
+        let valid = rows.iter().find(|row| row.parsed.is_ok()).unwrap();
+        assert_eq!(valid.task_key.as_deref(), Some("task-a"));
+        let corrupt = rows.iter().find(|row| row.parsed.is_err()).unwrap();
+        assert_eq!(corrupt.job_id, corrupt_job.id.0.to_string());
+        assert_eq!(corrupt.task_key.as_deref(), Some("task-b"));
+    }
+
+    #[test]
+    fn referenced_blob_digests_include_malformed_rows_conservatively() {
+        let mut graph = Graph::open_in_memory().unwrap();
+        let job = graph.create_job("task-a", "digests-1").unwrap();
+        graph.transition_job(job.id, JobState::Running).unwrap();
+        graph.transition_job(job.id, JobState::Succeeded).unwrap();
+        let structural = format!("sha256:{}", "1".repeat(64));
+        let mut result =
+            JobResult::new(job.id, JobState::Succeeded, evidence_governance()).unwrap();
+        result.change_set = Some(crate::ChangeSet {
+            base_revision: "sha256:base".into(),
+            patch_digest: "sha256:patch".into(),
+            files: vec![crate::ChangedFile {
+                path: "a.txt".into(),
+                status: crate::ChangeStatus::Added,
+                before: None,
+                after: Some(crate::FileEvidence {
+                    digest: structural.clone(),
+                    bytes: b"a".to_vec(),
+                    blob: None,
+                    executable: false,
+                }),
+            }],
+        });
+        graph.record_job_result(&result).unwrap();
+        let scanned = format!("sha256:{}", "a".repeat(64));
+        let corrupt_job = graph.create_job("task-b", "digests-corrupt").unwrap();
+        graph
+            .transition_job(corrupt_job.id, JobState::Running)
+            .unwrap();
+        graph
+            .transition_job(corrupt_job.id, JobState::Failed)
+            .unwrap();
+        graph
+            .conn
+            .execute(
+                "INSERT INTO job_results (job_id, result, created_at)
+                 VALUES (?1, ?2, '2026-01-01T00:00:00Z')",
+                params![
+                    corrupt_job.id.0.to_string(),
+                    format!("{{\"broken\": \"{scanned}\"")
+                ],
+            )
+            .unwrap();
+
+        let digests = graph.referenced_blob_digests().unwrap();
+        assert!(digests.contains(&structural), "structural reference kept");
+        assert!(
+            digests.contains(&scanned),
+            "corrupt row's digests must never be treated as unreferenced"
+        );
+    }
+
+    #[test]
+    fn blob_store_root_is_only_present_for_file_backed_graphs() {
+        let graph = Graph::open_in_memory().unwrap();
+        assert!(graph.blob_store_root().unwrap().is_none());
+
+        let root = std::env::temp_dir().join(format!("foundry-blob-root-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let file_backed = Graph::open(&root.join("db.sqlite")).unwrap();
+        let store = file_backed.blob_store_root().unwrap().unwrap();
+        assert!(store.ends_with("blobs/sha256"));
+        drop(file_backed);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

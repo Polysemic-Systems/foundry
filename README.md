@@ -4,6 +4,12 @@ A local-first, self-building production system.
 
 > Code is the spec. The system builds itself.
 
+Foundry consumes the MIT-licensed `digest`, `lethe`, and `polysemic-core`
+crates from the sibling [polysemic](../polysemic/) workspace as path
+dependencies: building Foundry requires the `polysemic/` checkout next to
+`foundry/`. Digest is Foundry's model-output boundary (named repairs,
+ambiguity as questions); Lethe is its evidence-erasure contract.
+
 ## Quick start
 
 ```bash
@@ -32,6 +38,45 @@ just iterate  # reflects the approval in the plan and selects the next task
 
 Use `review-reject` with the same arguments to return the task to `ready` for a
 new attempt. Reusing an idempotency key returns the original immutable result.
+
+### The digest boundary
+
+Every model-generated payload crosses the `digest` seam before Foundry trusts
+its shape. `foundry propose` asks the model for one JSON object
+(`{"spec": ..., "tasks": [...]}`); malformed output is repaired with every fix
+named on a printed ledger (stripped fences, requoted strings, Python literals,
+trailing commas, case-folded enums), and genuine ambiguity becomes questions
+the human can answer interactively instead of a silent guess. Review-draft
+agents must likewise emit `{"recommendation": "approve" | "reject", "body":
+"<Socratic markdown>"}`; the recommendation is schema-enforced and
+case-folded. Each crossing is recorded as a `model_output_digested` event with
+its repair, question, and answer ledgers.
+
+### Retention sweep
+
+Every job result carries a governed `RetentionPolicy`; `foundry sweep`
+enforces it. The default policy stays `ReviewAfter { now + 30 days }`; pass
+`--evidence-retention-days N` to `job-run` (or set
+`FOUNDRY_EVIDENCE_RETENTION_DAYS`) to opt a job's evidence into
+`DeleteAfter { now + N days }`.
+
+```bash
+foundry sweep            # dry-run report: delete-due, review-due, deferred, retained, quarantined
+foundry sweep --enforce  # erase delete-due evidence, collect orphaned blobs, record receipts
+```
+
+Enforcement runs through lethe's erasure contract: two stores (the SQLite
+`job_results` row and the content-addressed blob store) are erased and
+independently verified absent by an `ErasureCoordinator`; blobs shared with
+surviving results are kept by reference counting. Receipts are one-way
+commitments (`lethe://request/<hash>`, `foundry://erasure/<store>/sha256:<hash>`)
+recorded as `evidence_erased` and `retention_swept` events — counts and hashes,
+never content. The `jobs`, `reviews`, and `events` rows are append-only history
+and are never deleted. Delete-due evidence whose task sits in review is
+deferred: retention never removes evidence from under an open human decision.
+Malformed stored results are quarantined and reported, and their blobs are
+conservatively treated as referenced. Do not run `sweep --enforce` while jobs
+are actively executing (a one-hour age guard protects freshly written blobs).
 
 ### Evidence-grounded review TUI
 

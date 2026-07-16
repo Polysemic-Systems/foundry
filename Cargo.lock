@@ -291,6 +291,13 @@ dependencies = [
 
 [[package]]
 name = "digest"
+version = "0.1.0"
+dependencies = [
+ "polysemic-core",
+]
+
+[[package]]
+name = "digest"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9ed9a281f7bc9b7576e61468ba615a66a5c8cfdff42420a70aa82701a3b1e292"
@@ -353,7 +360,10 @@ dependencies = [
  "chrono",
  "clap",
  "crossterm",
+ "digest 0.1.0",
  "foundry-core",
+ "lethe",
+ "polysemic-core",
  "ratatui",
  "serde",
  "serde_json",
@@ -531,6 +541,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "lethe"
+version = "0.1.0"
+
+[[package]]
 name = "libc"
 version = "0.2.186"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -656,6 +670,10 @@ name = "pkg-config"
 version = "0.3.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
+
+[[package]]
+name = "polysemic-core"
+version = "0.1.0"
 
 [[package]]
 name = "proc-macro2"
@@ -817,7 +835,7 @@ checksum = "a7507d819769d01a365ab707794a4084392c824f54a7a6a7862f8c3d0892b283"
 dependencies = [
  "cfg-if",
  "cpufeatures",
- "digest",
+ "digest 0.10.7",
 ]
 
 [[package]]
