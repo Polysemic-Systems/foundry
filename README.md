@@ -157,7 +157,9 @@ own sandboxed verification and review gate. Configure an agent that accepts its
 instructions on standard input, then run the feature plan:
 
 ```bash
-export FOUNDRY_AGENT_COMMAND='codex exec --full-auto -'
+export FOUNDRY_AGENT_COMMAND='codex exec --sandbox workspace-write --skip-git-repo-check -'
+# --skip-git-repo-check: attempt copies deliberately exclude .git, and codex
+# otherwise refuses to run outside a trusted (git) directory.
 export FOUNDRY_AGENT_NETWORK=on # explicit consent for a remote coding agent
 just iterate-tdd
 ```
