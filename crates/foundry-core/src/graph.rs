@@ -268,6 +268,8 @@ pub enum GraphError {
     StaleTransition { key: String, expected: String },
     #[error("unknown edge kind stored in database: {kind}")]
     UnknownEdgeKind { kind: String },
+    #[error("could not checkpoint the WAL: another connection is holding it open")]
+    WalCheckpointBlocked,
 }
 
 #[derive(Debug)]
@@ -438,6 +440,20 @@ impl Graph {
         self.conn.execute("DELETE FROM edges", [])?;
         self.conn
             .execute("DELETE FROM nodes WHERE kind != 'rule'", [])?;
+        Ok(())
+    }
+
+    /// Fold every committed WAL transaction into the main database file so
+    /// that a bare copy of that file contains all committed history. Closing
+    /// a connection only checkpoints when it is the last one anywhere, so
+    /// callers about to copy the file must checkpoint explicitly.
+    pub fn checkpoint_wal(&self) -> Result<(), GraphError> {
+        let busy: i64 = self
+            .conn
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))?;
+        if busy != 0 {
+            return Err(GraphError::WalCheckpointBlocked);
+        }
         Ok(())
     }
 
