@@ -14,6 +14,6 @@
 12. [x] Modify transition_job to implement a conditional update check based on the current state. - files: crates/foundry-core/src/graph.rs
 13. [x] Define and incorporate the specific error variant (e.g., StaleTransition or lost-race) into the GraphError enum for use in transitions. - files: crates/foundry-core/src/graph.rs
 14. [x] Implement regression tests under `cfg(test)` that simulate concurrent, mismatched state reads to verify the error handling path. - run: cargo test
-15. [ ] Modify `crates/foundry-cli/src/main.rs` to obtain a mutable graph handle and integrate the logic for emitting a `RuleTriggered` event after each rule execution. - files: crates/foundry-cli/src/main.rs - run: cargo test
-16. [ ] Implement the code within `crates/foundry-cli/src/main.rs` to call the graph recording mechanism with the rule node ID and result upon completion of checking rules. - files: crates/foundry-cli/src/main.rs - run: cargo test
-17. [ ] Update the assertion logic within `crates/foundry-core/src/rules.rs` to verify that the newly recorded events are present in the graph history. - files: crates/foundry-core/src/rules.rs - run: cargo test
+15. [x] Modify `crates/foundry-cli/src/main.rs` to obtain a mutable graph handle and integrate the logic for emitting a `RuleTriggered` event after each rule execution. - files: crates/foundry-cli/src/main.rs - run: cargo test
+16. [x] Implement the code within `crates/foundry-cli/src/main.rs` to call the graph recording mechanism with the rule node ID and result upon completion of checking rules. - files: crates/foundry-cli/src/main.rs - run: cargo test
+17. [x] Update the assertion logic within `crates/foundry-core/src/rules.rs` to verify that the newly recorded events are present in the graph history. - files: crates/foundry-core/src/rules.rs - run: cargo test
