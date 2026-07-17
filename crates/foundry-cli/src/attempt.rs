@@ -1,4 +1,4 @@
-use crate::runner::sha256_digest;
+use crate::{manifest, runner::sha256_digest};
 use anyhow::{Context, Result, bail};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -48,21 +48,12 @@ pub fn prepare(root: &Path, task_key: &str) -> Result<PathBuf> {
 /// container mount that follows it is read-only, and the editor-agent
 /// sandbox never binds it at all.
 fn link_sibling_path_dependencies(root: &Path, attempts: &Path) -> Result<()> {
-    let Ok(manifest) = fs::read_to_string(root.join("Cargo.toml")) else {
-        return Ok(());
-    };
     let Some(parent) = root.parent() else {
         return Ok(());
     };
-    for capture in manifest.split("path = \"../").skip(1) {
-        let Some(name) = capture.split('"').next().and_then(|r| r.split('/').next()) else {
-            continue;
-        };
-        if name.is_empty() || name.contains("..") {
-            continue;
-        }
-        let source = parent.join(name);
-        let link = attempts.join(name);
+    for name in manifest::sibling_path_dependencies(root)? {
+        let source = parent.join(&name);
+        let link = attempts.join(&name);
         if !source.is_dir() || link.exists() {
             continue;
         }

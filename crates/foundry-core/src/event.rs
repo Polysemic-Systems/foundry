@@ -16,7 +16,16 @@ pub enum Event {
         edge_kind: String,
     },
     /// A task was planned.
-    TaskPlanned { task_id: NodeId, plan_id: NodeId },
+    TaskPlanned {
+        task_id: NodeId,
+        plan_id: NodeId,
+        /// Durable plan-relative task key. Empty only on legacy rows.
+        #[serde(default)]
+        task_key: String,
+        /// Durable plan path. Empty only on legacy rows.
+        #[serde(default)]
+        plan_path: String,
+    },
     /// A plan markdown file was indexed into the graph.
     PlanIndexed { path: String, plan_id: NodeId },
     /// A code file was indexed.
@@ -56,21 +65,36 @@ pub enum Event {
     /// A task started executing.
     TaskStarted {
         task_id: NodeId,
+        /// Durable plan-relative task key. Empty only on legacy rows.
+        #[serde(default)]
+        task_key: String,
         description: String,
     },
     /// A task completed successfully.
     TaskCompleted {
         task_id: NodeId,
+        /// Durable plan-relative task key. Empty only on legacy rows.
+        #[serde(default)]
+        task_key: String,
         description: String,
     },
     /// A task failed during execution.
     TaskFailed {
         task_id: NodeId,
+        /// Durable plan-relative task key. Empty only on legacy rows.
+        #[serde(default)]
+        task_key: String,
         description: String,
         reason: String,
     },
     /// A plan stop point was reached and requires human approval.
-    StopPointReached { task_id: NodeId, reason: String },
+    StopPointReached {
+        task_id: NodeId,
+        /// Durable plan-relative task key. Empty only on legacy rows.
+        #[serde(default)]
+        task_key: String,
+        reason: String,
+    },
     /// A deployment happened.
     Deployed { target: String, node_id: NodeId },
     /// A feature was proposed and approved by the user.
@@ -190,6 +214,66 @@ impl Event {
             Event::PlanReconciled { .. } => "plan_reconciled",
         }
     }
+
+    /// Ephemeral graph-node references carried by this event.
+    ///
+    /// Durable task keys are intentionally reported separately: a missing
+    /// node can be expected after a destructive rebuild, but task history
+    /// remains narratable when [`Self::durable_task_key`] is present.
+    pub fn node_references(&self) -> Vec<NodeId> {
+        match self {
+            Event::NodeCreated { node_id }
+            | Event::CodeIndexed { node_id, .. }
+            | Event::RuleTriggered {
+                rule_id: node_id, ..
+            }
+            | Event::TaskStarted {
+                task_id: node_id, ..
+            }
+            | Event::TaskCompleted {
+                task_id: node_id, ..
+            }
+            | Event::TaskFailed {
+                task_id: node_id, ..
+            }
+            | Event::StopPointReached {
+                task_id: node_id, ..
+            }
+            | Event::Deployed { node_id, .. } => vec![*node_id],
+            Event::EdgeCreated { from, to, .. } => vec![*from, *to],
+            Event::TaskPlanned {
+                task_id, plan_id, ..
+            } => vec![*task_id, *plan_id],
+            Event::PlanIndexed { plan_id, .. } => vec![*plan_id],
+            Event::ReviewRequested { review_id, task_id } => vec![*review_id, *task_id],
+            Event::ModelInvoked { .. }
+            | Event::DiscourseTurnRecorded { .. }
+            | Event::ReviewDrafted { .. }
+            | Event::ReviewResolved { .. }
+            | Event::FeatureProposed { .. }
+            | Event::SnapshotCreated { .. }
+            | Event::SnapshotRestored { .. }
+            | Event::ModelOutputDigested { .. }
+            | Event::EvidenceErased { .. }
+            | Event::RetentionSwept { .. }
+            | Event::PlanReconciled { .. } => Vec::new(),
+        }
+    }
+
+    /// Stable task identity carried by task lifecycle events written by
+    /// current Foundry versions. Legacy events deserialize with an empty key
+    /// and therefore return `None`.
+    pub fn durable_task_key(&self) -> Option<&str> {
+        let key = match self {
+            Event::TaskPlanned { task_key, .. }
+            | Event::TaskStarted { task_key, .. }
+            | Event::TaskCompleted { task_key, .. }
+            | Event::TaskFailed { task_key, .. }
+            | Event::StopPointReached { task_key, .. } => task_key,
+            _ => return None,
+        };
+        (!key.is_empty()).then_some(key)
+    }
 }
 
 #[cfg(test)]
@@ -249,5 +333,18 @@ mod tests {
             let back: Event = serde_json::from_str(&json).expect("deserializes");
             assert_eq!(back.kind(), event.kind());
         }
+    }
+
+    #[test]
+    fn legacy_task_events_decode_but_name_their_missing_durable_key() {
+        let task_id = NodeId::new();
+        let old_json = format!(
+            r#"{{"event":"task_started","task_id":"{}","description":"legacy"}}"#,
+            task_id.0
+        );
+        let event: Event = serde_json::from_str(&old_json).expect("legacy event decodes");
+        assert_eq!(event.kind(), "task_started");
+        assert_eq!(event.durable_task_key(), None);
+        assert_eq!(event.node_references(), vec![task_id]);
     }
 }

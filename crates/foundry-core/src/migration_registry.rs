@@ -145,6 +145,25 @@ pub fn migrations() -> Vec<(i64, &'static str)> {
                 CREATE INDEX IF NOT EXISTS idx_discourse_turns_context
                     ON discourse_turns(context_key, created_at);",
         ),
+        (
+            8,
+            "CREATE INDEX IF NOT EXISTS idx_events_created_at
+                    ON events(created_at);",
+        ),
+        (
+            9,
+            "CREATE TABLE IF NOT EXISTS pending_review_resolutions (
+                    id TEXT PRIMARY KEY,
+                    task_key TEXT NOT NULL,
+                    job_id TEXT NOT NULL,
+                    resolution TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(task_key, job_id),
+                    FOREIGN KEY (job_id) REFERENCES jobs(id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_pending_review_resolutions_task
+                    ON pending_review_resolutions(task_key);",
+        ),
     ]
 }
 

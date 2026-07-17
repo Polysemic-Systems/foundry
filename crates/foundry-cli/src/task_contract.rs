@@ -26,7 +26,7 @@ pub fn validate(root: &Path, files: &[String], run: Option<&str>) -> Vec<String>
         }
     }
     if let Some(run) = run
-        && let Err(error) = crate::safe_job_command(run)
+        && let Err(error) = crate::commands::common::safe_job_command(run)
     {
         errors.push(format!(
             "unsafe or unsupported run command `{run}`: {error}"

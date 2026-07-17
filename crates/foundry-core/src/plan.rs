@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::path::Path;
 
 /// A plan is an executable DAG derived from markdown-plan syntax.
 /// This is intentionally minimal; the parser lives separately.
@@ -119,6 +120,27 @@ pub struct InvalidTaskId {
 const TAG_TERMINATORS: [&str; 4] = [" - run:", " - stop:", " - files:", " - id:"];
 
 impl Plan {
+    /// Derive the plan's stable display title from its filename. The
+    /// conventional `.plan.md` suffix is removed as a unit.
+    pub fn title_from_path(path: &Path) -> String {
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("plan");
+        name.strip_suffix(".plan.md")
+            .or_else(|| path.file_stem().and_then(|stem| stem.to_str()))
+            .unwrap_or(name)
+            .to_string()
+    }
+
+    pub fn parse_path(path: &Path, source: &str) -> Self {
+        Self::parse(Self::title_from_path(path), source)
+    }
+
+    pub fn parse_path_strict(path: &Path, source: &str) -> (Self, Vec<InvalidTaskId>) {
+        Self::parse_strict(Self::title_from_path(path), source)
+    }
+
     pub fn parse(title: impl Into<String>, source: &str) -> Self {
         Self::parse_strict(title, source).0
     }
@@ -333,6 +355,15 @@ mod tests {
         assert!(plan.tasks[0].id_is_explicit);
         assert_eq!(plan.tasks[0].run.as_deref(), Some("cargo test"));
         assert_eq!(plan.tasks[0].description, "Snapshot checkpoints the WAL");
+    }
+
+    #[test]
+    fn path_parser_removes_the_complete_plan_suffix_from_title() {
+        let plan = Plan::parse_path(
+            Path::new("plans/features.plan.md"),
+            "# Any heading\n\n1. [ ] Work\n",
+        );
+        assert_eq!(plan.title, "features");
     }
 
     #[test]

@@ -79,10 +79,23 @@ pub fn reconcile(
         if !task.id_is_explicit {
             report.derived_ids.push(task.id.clone());
         }
-        let state = graph_states
+        let current_state = graph_states
             .iter()
             .find(|(key, _)| key == &key_of(&task.id))
             .and_then(|(_, state)| *state);
+        let legacy_key = format!("{plan_relative}#task-{}", task.line_index);
+        let legacy_state = (legacy_key != key_of(&task.id))
+            .then(|| {
+                graph_states
+                    .iter()
+                    .find(|(key, _)| key == &legacy_key)
+                    .and_then(|(_, state)| *state)
+            })
+            .flatten();
+        // Reconciliation must describe the state *after* its safe key
+        // migrations. Otherwise a Done legacy task needs two --apply runs:
+        // one to move the key and another to synchronize the plan mark.
+        let state = current_state.or(legacy_state);
         match state {
             Some(TaskState::Done) if !task.done => report.unmarked_done.push(task.id.clone()),
             Some(state) if task.done && state != TaskState::Done => report
@@ -225,6 +238,15 @@ mod tests {
             report.marked_done_but_graph_disagrees,
             vec![(TaskId::parse("beta").unwrap(), TaskState::Ready)]
         );
+    }
+
+    #[test]
+    fn legacy_done_state_is_synchronized_in_the_same_repair() {
+        let (plan, invalid) = plan_and_invalid("# F\n\n1. [ ] Alpha - id: alpha\n");
+        let states = vec![("plans/f.plan.md#task-2".to_string(), Some(TaskState::Done))];
+        let report = reconcile("plans/f.plan.md", &plan, &invalid, &states);
+        assert_eq!(report.migratable.len(), 1);
+        assert_eq!(report.unmarked_done, vec![TaskId::parse("alpha").unwrap()]);
     }
 
     #[test]

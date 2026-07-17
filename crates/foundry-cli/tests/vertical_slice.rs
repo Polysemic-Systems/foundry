@@ -316,6 +316,7 @@ fn tdd_job_evidence_captures_changes_made_before_sandbox_verification() {
          if [ \"$1\" = run ]; then\n\
            case \" $* \" in\n\
              *\" rustup toolchain list \"*) echo '1.92.0-test (default)'; exit 0 ;;\n\
+             *\" true \"*) exit 0 ;;\n\
            esac\n\
            count_file=\"$FAKE_ROOT/podman-count\"\n\
            count=0\n\
@@ -420,6 +421,7 @@ fn tdd_job_evidence_keeps_the_pre_agent_baseline_across_failed_verification_retr
          if [ \"$1\" = run ]; then\n\
            case \" $* \" in\n\
              *\" rustup toolchain list \"*) echo '1.92.0-test (default)'; exit 0 ;;\n\
+             *\" true \"*) exit 0 ;;\n\
            esac\n\
            count_file=\"$FAKE_ROOT/podman-count\"\n\
            count=0\n\
@@ -502,6 +504,11 @@ fn tdd_job_evidence_keeps_the_pre_agent_baseline_across_failed_verification_retr
         .into_iter()
         .find(|result| result.state == foundry_core::JobState::Succeeded)
         .expect("successful retry evidence");
+    assert_eq!(
+        result.acceptance_authority.as_deref(),
+        Some("retry-without-observed-red-phase"),
+        "a repair-only process must not inherit red-phase authority it did not revalidate"
+    );
     let changes = result.change_set.expect("retry change set");
     for expected in ["initial-agent-change.txt", "repair-agent-change.txt"] {
         assert!(
@@ -543,6 +550,7 @@ fn staged_tdd_changes_reach_the_authoritative_workspace_only_after_approval() {
          if [ \"$1\" = run ]; then\n\
            case \" $* \" in\n\
              *\" rustup toolchain list \"*) echo '1.92.0-test (default)'; exit 0 ;;\n\
+             *\" true \"*) exit 0 ;;\n\
            esac\n\
            count_file=\"$FAKE_ROOT/podman-count\"\n\
            count=0\n\
@@ -672,6 +680,37 @@ fn staged_tdd_changes_reach_the_authoritative_workspace_only_after_approval() {
         fs::read_to_string(root.join("source.txt")).unwrap(),
         "authoritative\n"
     );
+
+    let repository_lease = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(root.join(".foundry/repository.lease"))
+        .unwrap();
+    repository_lease.lock().unwrap();
+    let blocked = review(
+        "review-approve",
+        second_job.job_id.0,
+        "the second evidence bundle is sufficient",
+    );
+    assert!(
+        !blocked.status.success(),
+        "promotion must refuse while iteration holds the repository lease"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("source.txt")).unwrap(),
+        "authoritative\n",
+        "a refused promotion must not edit the authoritative workspace"
+    );
+    assert_eq!(
+        Graph::open(&db)
+            .unwrap()
+            .task_state("plans/promotion.plan.md#stage-safely")
+            .unwrap(),
+        Some(TaskState::Review)
+    );
+    std::fs::File::unlock(&repository_lease).unwrap();
 
     let approved = review(
         "review-approve",

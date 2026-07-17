@@ -12,15 +12,28 @@ help:
 build *args:
     cargo build {{ if args == "" { "--workspace" } else { args } }}
 
-# Run all checks: format, clippy, test
-check:
-    cargo fmt --all -- --check
-    cargo clippy --workspace --all-targets -- -D warnings
-    cargo test --workspace
+# Fast deterministic gate used by pre-commit.
+gate-fast:
+    ./scripts/gate-fast.sh
 
-# Deploy foundry to itself: build the system inside the runner sandbox.
-deploy:
+# Authoritative gate used by pre-push and CI.
+gate-full:
+    ./scripts/gate-full.sh
+
+# Backwards-compatible name for the authoritative gate.
+check: gate-full
+
+# Enable the versioned local hooks for this checkout.
+install-hooks:
+    git config core.hooksPath .githooks
+    @echo "Installed Foundry hooks from .githooks/"
+
+# Build the mounted workspace in Podman; does not install, publish, or deploy.
+sandbox-build:
     just sandbox cargo build --workspace
+
+# Backwards-compatible alias; prefer `just sandbox-build`.
+deploy: sandbox-build
 
 # Run the CLI; extra args forwarded to the binary
 run *args:
@@ -56,7 +69,7 @@ heal:
 
 # Run self-diagnostic checks
 doctor:
-    cargo run -p foundry-cli -- doctor --root . --db ./.foundry/db.sqlite --plan ./plans/bootstrap.plan.md
+    cargo run -p foundry-cli -- doctor --root . --db ./.foundry/db.sqlite --plan ./plans/features.plan.md
 
 # Run rule-based diagnostics on the graph
 check-rules:
@@ -66,18 +79,26 @@ check-rules:
 ask query:
     cargo run -p foundry-cli -- ask --db ./.foundry/db.sqlite "{{query}}"
 
-# Execute the next undone task in the bootstrap plan
+# Execute the next undone task in the active feature plan
 iterate:
-    @cargo run --quiet -p foundry-cli -- iterate --plan ./plans/bootstrap.plan.md --root . --db ./.foundry/db.sqlite
+    @cargo run --quiet -p foundry-cli -- iterate --plan ./plans/features.plan.md --root . --db ./.foundry/db.sqlite
 
 # Execute the next feature task through a test-first editor agent.
 # Set FOUNDRY_AGENT_COMMAND, for example: codex exec --full-auto -
 iterate-tdd *args:
     @cargo run --quiet -p foundry-cli -- iterate --tdd --plan ./plans/features.plan.md --root . --db ./.foundry/db.sqlite {{args}}
 
-# Compare two generated review drafts and submit the edited human resolution.
+# Answer the two-draft review questionnaire and submit the human resolution.
 review-tui task job reviewer:
-    @cargo run --quiet -p foundry-cli -- review-tui --root . --db ./.foundry/db.sqlite --task {{quote(task)}} --job {{job}} --reviewer {{quote(reviewer)}}
+    @cargo run --quiet -p foundry-cli -- review-tui --root . --db ./.foundry/db.sqlite --task {{quote(task)}} --job {{quote(job)}} --reviewer {{quote(reviewer)}}
+
+# Approve successful job evidence and complete its task.
+review-approve task job reviewer reason:
+    @cargo run --quiet -p foundry-cli -- review-approve --root . --db ./.foundry/db.sqlite --task {{quote(task)}} --job {{quote(job)}} --reviewer {{quote(reviewer)}} --reason {{quote(reason)}}
+
+# Reject successful job evidence and return its task to ready.
+review-reject task job reviewer reason:
+    @cargo run --quiet -p foundry-cli -- review-reject --root . --db ./.foundry/db.sqlite --task {{quote(task)}} --job {{quote(job)}} --reviewer {{quote(reviewer)}} --reason {{quote(reason)}}
 
 # Show the bootstrap plan
 plan:

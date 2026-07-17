@@ -87,6 +87,16 @@ fn visit_evidence_mut(
 fn externalize(root: &Path, evidence: &mut FileEvidence) -> Result<(), EvidenceStoreError> {
     let hex = digest_hex(&evidence.digest)?;
     verify_bytes(evidence)?;
+    for path in [
+        root.parent().and_then(Path::parent),
+        root.parent(),
+        Some(root),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        reject_existing_symlink(path)?;
+    }
     fs::create_dir_all(root).map_err(|source| io_error(root, source))?;
     for path in [
         root.parent().and_then(Path::parent),
@@ -202,4 +212,52 @@ fn reject_symlink(path: &Path) -> Result<(), EvidenceStoreError> {
         });
     }
     Ok(())
+}
+
+fn reject_existing_symlink(path: &Path) -> Result<(), EvidenceStoreError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(EvidenceStoreError::Io {
+            path: path.to_path_buf(),
+            source: std::io::Error::other("content store path is a symbolic link"),
+        }),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(io_error(path, source)),
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn externalize_refuses_a_symlinked_parent_before_creating_store_directories() {
+        let base = std::env::temp_dir().join(format!(
+            "foundry-evidence-symlink-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let state = base.join(".foundry");
+        let outside = base.join("outside");
+        fs::create_dir_all(&state).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, state.join("blobs")).unwrap();
+        let bytes = b"private evidence".to_vec();
+        let mut evidence = FileEvidence {
+            digest: digest(&bytes),
+            bytes,
+            blob: None,
+            executable: false,
+        };
+
+        let error = externalize(&state.join("blobs/sha256"), &mut evidence)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("symbolic link"), "{error}");
+        assert!(
+            !outside.join("sha256").exists(),
+            "the symlink target must remain untouched"
+        );
+        fs::remove_dir_all(base).unwrap();
+    }
 }

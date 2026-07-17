@@ -5,6 +5,31 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+struct PrivateScratch {
+    path: PathBuf,
+}
+
+impl PrivateScratch {
+    fn create(path: PathBuf) -> Result<Self> {
+        if path.exists() {
+            fs::remove_dir_all(&path)
+                .with_context(|| format!("removing stale agent scratch {}", path.display()))?;
+        }
+        create_private_dir(&path)?;
+        Ok(Self { path })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for PrivateScratch {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
 pub fn network_enabled() -> bool {
     std::env::var("FOUNDRY_AGENT_NETWORK").is_ok_and(|value| value.eq_ignore_ascii_case("on"))
 }
@@ -19,10 +44,8 @@ pub fn run_editor(root: &Path, agent_command: &str, prompt: &str) -> Result<()> 
     let root = root
         .canonicalize()
         .with_context(|| format!("resolving isolated editor workspace {}", root.display()))?;
-    let scratch = root.join(".foundry-agent-tmp");
-    fs::create_dir_all(&scratch)
-        .with_context(|| format!("creating editor scratch directory {}", scratch.display()))?;
-    let mut command = sandboxed_command(&root, &scratch, program, &parts[1..], true)?;
+    let scratch = PrivateScratch::create(root.join(".foundry-agent-tmp"))?;
+    let mut command = sandboxed_command(&root, scratch.path(), program, &parts[1..], true)?;
     let mut child = command
         .current_dir(&root)
         .stdin(if prompt_as_argument {
@@ -55,7 +78,6 @@ pub fn run_editor(root: &Path, agent_command: &str, prompt: &str) -> Result<()> 
         }
     }
     let status = child.wait().context("waiting for editor agent")?;
-    let _ = fs::remove_dir_all(&scratch);
     if !status.success() {
         bail!("editor agent exited with status {status}");
     }
@@ -72,12 +94,11 @@ pub fn run_reviewer(root: &Path, agent_command: &str, prompt: &str) -> Result<St
     let root = root
         .canonicalize()
         .with_context(|| format!("resolving review workspace {}", root.display()))?;
-    let scratch = std::env::temp_dir().join(format!(
+    let scratch = PrivateScratch::create(std::env::temp_dir().join(format!(
         "foundry-review-agent-{}",
         uuid::Uuid::new_v4().simple()
-    ));
-    fs::create_dir(&scratch)?;
-    let mut command = sandboxed_command(&root, &scratch, program, &parts[1..], false)?;
+    )))?;
+    let mut command = sandboxed_command(&root, scratch.path(), program, &parts[1..], false)?;
     let mut child = command
         .current_dir(&root)
         .stdin(if prompt_as_argument {
@@ -99,7 +120,6 @@ pub fn run_reviewer(root: &Path, agent_command: &str, prompt: &str) -> Result<St
     let output = child
         .wait_with_output()
         .context("waiting for review agent")?;
-    let _ = fs::remove_dir_all(&scratch);
     if !output.status.success() {
         bail!("review agent exited with status {}", output.status);
     }
@@ -117,10 +137,18 @@ fn sandboxed_command(
     args: &[String],
     writable_root: bool,
 ) -> Result<Command> {
+    let invoked_name = Path::new(program)
+        .file_name()
+        .and_then(OsStr::to_str)
+        .unwrap_or(program);
+    let network_enabled = network_enabled();
+    require_network_consent(invoked_name, network_enabled)?;
     let sandbox_disabled =
         std::env::var("FOUNDRY_AGENT_SANDBOX").is_ok_and(|value| value.eq_ignore_ascii_case("off"));
     if sandbox_disabled {
-        eprintln!("warning: FOUNDRY_AGENT_SANDBOX=off; agent host writes are not constrained");
+        eprintln!(
+            "warning: FOUNDRY_AGENT_SANDBOX=off; the agent inherits the host environment, HOME, process namespace, network, and unconstrained filesystem access"
+        );
         let mut command = Command::new(program);
         command.args(args);
         return Ok(command);
@@ -135,22 +163,11 @@ fn sandboxed_command(
     // canonicalized target: version-managed installs symlink `claude` to a
     // file literally named `2.1.211`, and matching on that silently skips
     // credential preparation and the network-consent gate.
-    let invoked_name = Path::new(program)
-        .file_name()
-        .and_then(OsStr::to_str)
-        .unwrap_or(program);
     let clean_home = scratch.join("home");
     prepare_agent_home(invoked_name, &clean_home)?;
-    let network_enabled = network_enabled();
-    let remote_agent = matches!(invoked_name, "codex" | "kimi" | "claude");
-    if remote_agent && !network_enabled {
-        bail!(
-            "remote editor agent `{invoked_name}` needs outbound network access; explicitly consent with `export FOUNDRY_AGENT_NETWORK=on`, then retry",
-        );
-    }
     if network_enabled {
         eprintln!(
-            "warning: FOUNDRY_AGENT_NETWORK=on; the agent can transmit files visible inside its isolated workspace"
+            "warning: FOUNDRY_AGENT_NETWORK=on; the agent can reach host-network services and transmit visible workspace files and copied authentication material"
         );
     }
     let mut command = Command::new("bwrap");
@@ -164,6 +181,15 @@ fn sandboxed_command(
     ));
     command.args(args);
     Ok(command)
+}
+
+fn require_network_consent(invoked_name: &str, enabled: bool) -> Result<()> {
+    if matches!(invoked_name, "codex" | "kimi" | "claude") && !enabled {
+        bail!(
+            "remote editor agent `{invoked_name}` needs network access; explicitly consent with `export FOUNDRY_AGENT_NETWORK=on`, then retry",
+        );
+    }
+    Ok(())
 }
 
 fn sandbox_arguments(
@@ -276,7 +302,7 @@ fn resolve_executable(program: &str) -> Result<PathBuf> {
 }
 
 fn prepare_agent_home(invoked_name: &str, clean_home: &Path) -> Result<()> {
-    fs::create_dir_all(clean_home)?;
+    create_private_dir(clean_home)?;
     let host_home = std::env::var_os("HOME").map(PathBuf::from);
     let Some(host_home) = host_home else {
         return Ok(());
@@ -325,9 +351,33 @@ fn copy_private_config(host_home: &Path, clean_home: &Path, relative: &str) -> R
         return Ok(());
     }
     let destination = clean_home.join(relative);
-    fs::create_dir_all(destination.parent().context("agent config has no parent")?)?;
+    create_private_dir(destination.parent().context("agent config has no parent")?)?;
     fs::copy(&source, &destination)
         .with_context(|| format!("copying isolated agent configuration {}", source.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&destination, fs::Permissions::from_mode(0o600)).with_context(
+            || {
+                format!(
+                    "restricting copied agent configuration {}",
+                    destination.display()
+                )
+            },
+        )?;
+    }
+    Ok(())
+}
+
+fn create_private_dir(path: &Path) -> Result<()> {
+    fs::create_dir_all(path)
+        .with_context(|| format!("creating private directory {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("restricting private directory {}", path.display()))?;
+    }
     Ok(())
 }
 
@@ -383,5 +433,35 @@ mod tests {
             })
         );
         assert!(rendered.contains(&std::borrow::Cow::Borrowed("--clearenv")));
+    }
+
+    #[test]
+    fn remote_agents_require_network_consent_before_sandbox_setup() {
+        assert!(require_network_consent("codex", false).is_err());
+        assert!(require_network_consent("kimi", false).is_err());
+        assert!(require_network_consent("claude", false).is_err());
+        assert!(require_network_consent("local-reviewer", false).is_ok());
+        assert!(require_network_consent("codex", true).is_ok());
+    }
+
+    #[test]
+    fn private_scratch_is_removed_on_every_return_path() {
+        let path = std::env::temp_dir().join(format!(
+            "foundry-private-scratch-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        {
+            let scratch = PrivateScratch::create(path.clone()).unwrap();
+            fs::write(scratch.path().join("credential"), "secret").unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                assert_eq!(
+                    fs::metadata(scratch.path()).unwrap().permissions().mode() & 0o777,
+                    0o700
+                );
+            }
+        }
+        assert!(!path.exists());
     }
 }
