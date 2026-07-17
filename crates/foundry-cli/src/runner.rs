@@ -16,6 +16,10 @@ use walkdir::WalkDir;
 
 /// Maximum bytes captured from a job's stdout/stderr before truncation.
 const MAX_CAPTURE_BYTES: usize = 10 * 1024 * 1024;
+const _: () = assert!(
+    MAX_CAPTURE_BYTES > 0,
+    "the runner must define a named, non-zero byte limit"
+);
 
 /// Content-complete evidence for every relevant regular file in a workspace.
 pub type WorkspaceSnapshot = BTreeMap<String, FileEvidence>;
@@ -573,14 +577,6 @@ mod tests {
         assert!(
             !cap.text.contains("[output truncated"),
             "the captured text must not contain a truncation marker"
-        );
-    }
-
-    #[test]
-    fn default_capture_limit_is_a_reasonable_positive_size() {
-        assert!(
-            MAX_CAPTURE_BYTES > 0,
-            "the runner must define a named, non-zero byte limit"
         );
     }
 
