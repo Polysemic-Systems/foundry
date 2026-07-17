@@ -165,6 +165,10 @@ fn iterate_waits_for_recorded_review_before_advancing_plan() {
     assert!(first_output.contains("Status    PASSED"));
     assert!(!first_output.contains("\"stdout\":"));
     assert!(
+        first_output.contains("never been observed failing"),
+        "plain iterate must warn that a pass may be vacuous: {first_output}"
+    );
+    assert!(
         fs::read_to_string(&plan)
             .unwrap()
             .contains("[ ] Run checks")
@@ -174,6 +178,11 @@ fn iterate_waits_for_recorded_review_before_advancing_plan() {
     let task_key = "plans/safe.plan.md#run-checks";
     assert_eq!(graph.task_state(task_key).unwrap(), Some(TaskState::Review));
     let result = graph.job_results_for_task(task_key).unwrap().pop().unwrap();
+    assert_eq!(
+        result.acceptance_authority.as_deref(),
+        Some("unfalsified"),
+        "plain iterate evidence must record that the check never failed"
+    );
     drop(graph);
     let approved = Command::new(env!("CARGO_BIN_EXE_foundry-cli"))
         .args([
@@ -228,6 +237,56 @@ fn iterate_waits_for_recorded_review_before_advancing_plan() {
 /// The TDD tests exercise real Bubblewrap isolation. Environments without
 /// bwrap (e.g. Foundry verifying itself inside its own Podman runner) skip
 /// them with a named reason; CI installs bwrap and enforces full coverage.
+#[test]
+fn require_falsified_refuses_a_check_that_was_never_observed_failing() {
+    let root = std::env::temp_dir().join(format!(
+        "foundry-require-falsified-test-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let plans = root.join("plans");
+    fs::create_dir_all(&plans).unwrap();
+    let plan = plans.join("strict.plan.md");
+    fs::write(
+        &plan,
+        "# Strict plan\n\n1. [ ] Run checks - run: cargo test - id: run-checks\n",
+    )
+    .unwrap();
+    let db = root.join("foundry.sqlite");
+
+    let refused = Command::new(env!("CARGO_BIN_EXE_foundry-cli"))
+        .args([
+            "iterate",
+            "--plan",
+            plan.to_str().unwrap(),
+            "--root",
+            root.to_str().unwrap(),
+            "--db",
+            db.to_str().unwrap(),
+            "--require-falsified",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !refused.status.success(),
+        "plain iterate with --require-falsified must refuse"
+    );
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        stderr.contains("never observed failing"),
+        "the refusal must explain the falsifiability rule: {stderr}"
+    );
+
+    // Nothing was staged or recorded: the refusal happened before the run.
+    let graph = Graph::open(&db).unwrap();
+    assert_eq!(
+        graph
+            .job_results_for_task("plans/strict.plan.md#run-checks")
+            .unwrap(),
+        vec![]
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
 fn bwrap_available() -> bool {
     std::process::Command::new("bwrap")
         .arg("--version")

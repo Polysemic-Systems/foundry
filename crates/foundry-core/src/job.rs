@@ -304,6 +304,12 @@ pub struct JobResult {
     /// otherwise an explicitly `unresolved:` image reference.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub executor_image: Option<String>,
+    /// How this job's acceptance check earned authority — see
+    /// [`acceptance_authority`]. `None` on records that predate the field.
+    /// A check that was never observed failing proves nothing about the
+    /// task it claims to verify; reviews must see that difference.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acceptance_authority: Option<String>,
     /// Staged jobs ran outside the authoritative workspace. Their change set
     /// must be promoted only by an approving human review.
     #[serde(default)]
@@ -337,10 +343,26 @@ impl JobResult {
             tests: Vec::new(),
             change_set: None,
             executor_image: None,
+            acceptance_authority: None,
             staged: false,
             governance,
         })
     }
+}
+
+/// The recognized ways an acceptance check earns (or fails to earn) its
+/// authority. Falsifiability is the load-bearing property of the TDD
+/// loop: a check is trustworthy because it was observed failing before
+/// it passed. Where that observation never happened, the evidence says
+/// so, in the record itself, where review drafts and humans can see it.
+pub mod acceptance_authority {
+    /// The TDD red phase demonstrated this check failing before the
+    /// green phase made it pass.
+    pub const RED_PHASE: &str = "red-phase-observed-failing";
+    /// The check was never observed failing (plain `iterate`): a pass
+    /// may be vacuous — it can succeed against a workspace where the
+    /// task was never implemented.
+    pub const UNFALSIFIED: &str = "unfalsified";
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]

@@ -62,6 +62,25 @@ pub fn deterministic_evidence_review(task_key: &str, result: &JobResult) -> Revi
         }
         _ => blockers.push("The executor image is not resolved to an immutable local ID.".into()),
     }
+    match result.acceptance_authority.as_deref() {
+        Some(foundry_core::job::acceptance_authority::RED_PHASE) => {
+            observations.push("The acceptance check was observed failing before it passed.".into());
+        }
+        Some(foundry_core::job::acceptance_authority::UNFALSIFIED) => {
+            observations.push(
+                "WARNING: the acceptance check was NEVER observed failing; \
+                 this pass may be vacuous (it could succeed with the task unimplemented)."
+                    .into(),
+            );
+        }
+        Some(other) => {
+            observations.push(format!("Unrecognized acceptance authority: {other}."));
+        }
+        None => {
+            observations
+                .push("The record predates acceptance-authority tracking (unknown).".into());
+        }
+    }
     let recommendation = if blockers.is_empty() {
         ReviewDecision::Approve
     } else {
@@ -156,7 +175,70 @@ fn evidence_preview(evidence: Option<&foundry_core::FileEvidence>, limit: usize)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use foundry_core::{ChangeSet, ChangeStatus, ChangedFile, FileEvidence};
+    use foundry_core::{
+        ChangeSet, ChangeStatus, ChangedFile, FileEvidence, GovernanceEnvelope, JobId, JobResult,
+        JobState, KnowledgeLayer, RetentionPolicy, SourceRef, Transformation,
+        job::acceptance_authority,
+    };
+
+    fn result_with_authority(authority: Option<&str>) -> JobResult {
+        let governance = GovernanceEnvelope {
+            layer: KnowledgeLayer::Observed,
+            sources: vec![SourceRef {
+                uri: "job://test/output".into(),
+                digest: None,
+            }],
+            assumptions: Vec::new(),
+            transformation: Transformation {
+                name: "capture-job-result".into(),
+                version: "1".into(),
+                input_digests: Vec::new(),
+            },
+            owner: "review-policy-tests".into(),
+            retention: RetentionPolicy::Preserve {
+                basis: "test evidence".into(),
+            },
+        };
+        let mut result = JobResult::new(JobId::new(), JobState::Succeeded, governance).unwrap();
+        result.acceptance_authority = authority.map(str::to_string);
+        result
+    }
+
+    #[test]
+    fn unfalsified_evidence_is_loudly_marked_in_the_draft() {
+        let result = result_with_authority(Some(acceptance_authority::UNFALSIFIED));
+        let draft = deterministic_evidence_review("plans/f.plan.md#some-task", &result);
+        assert!(
+            draft.body.contains("NEVER observed failing"),
+            "the draft must force review visibility of vacuous evidence: {}",
+            draft.body
+        );
+    }
+
+    #[test]
+    fn red_phase_authority_is_reported_as_an_observation() {
+        let result = result_with_authority(Some(acceptance_authority::RED_PHASE));
+        let draft = deterministic_evidence_review("plans/f.plan.md#some-task", &result);
+        assert!(
+            draft.body.contains("observed failing before it passed"),
+            "{}",
+            draft.body
+        );
+        assert!(!draft.body.contains("NEVER observed failing"));
+    }
+
+    #[test]
+    fn legacy_records_without_authority_are_reported_as_unknown() {
+        let result = result_with_authority(None);
+        let draft = deterministic_evidence_review("plans/f.plan.md#some-task", &result);
+        assert!(
+            draft
+                .body
+                .contains("predates acceptance-authority tracking"),
+            "{}",
+            draft.body
+        );
+    }
 
     #[test]
     fn evidence_contains_recorded_before_and_after_content() {
