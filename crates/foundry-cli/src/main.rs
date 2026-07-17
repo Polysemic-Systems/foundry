@@ -2,12 +2,12 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use foundry_core::{
     Artifact, DiscourseAct, DiscourseSpeaker, DiscourseTurn, Event, GovernanceEnvelope, JobId,
-    JobResult, JobState, KnowledgeLayer, RetentionPolicy, Review, ReviewDecision, ReviewDraft,
-    ReviewPerspective, ReviewResolution, RuleResult, SourceRef, TaskState, TestResult,
-    Transformation,
+    JobResult, JobState, KeyMigrationRecord, KnowledgeLayer, RetentionPolicy, Review,
+    ReviewDecision, ReviewDraft, ReviewPerspective, ReviewResolution, RuleResult, SourceRef,
+    TaskState, TestResult, Transformation,
     graph::{Graph, NodeKind},
     plan::Plan,
-    sanitize_query,
+    plan_reconcile, sanitize_query,
 };
 use std::fs;
 use std::io::Write;
@@ -217,6 +217,24 @@ enum Commands {
         /// Path to the SQLite database.
         #[arg(long, default_value = "./.foundry/db.sqlite")]
         db: PathBuf,
+    },
+    /// Audit plan/graph identity in both directions: legacy positional
+    /// task keys, orphaned graph state, derived ids, and done-state drift.
+    /// --apply performs the safe repairs and records the event.
+    ReconcilePlan {
+        /// Path to the plan file.
+        #[arg(long, default_value = "./plans/bootstrap.plan.md")]
+        plan: PathBuf,
+        /// Project root.
+        #[arg(long, default_value = ".")]
+        root: PathBuf,
+        /// Path to the SQLite database.
+        #[arg(long, default_value = "./.foundry/db.sqlite")]
+        db: PathBuf,
+        /// Migrate legacy keys, persist explicit id tags into the plan
+        /// file, and reindex. Orphaned keys are only ever reported.
+        #[arg(long)]
+        apply: bool,
     },
     /// Detect drift and rebuild the graph if needed.
     Heal {
@@ -464,6 +482,12 @@ fn main() -> Result<()> {
         } => cmd_semsearch(&db, &model, &query, limit),
         Commands::Rebuild { root, db, embed } => cmd_rebuild(&root, &db, embed),
         Commands::Reconcile { root, db } => cmd_reconcile(&root, &db),
+        Commands::ReconcilePlan {
+            plan,
+            root,
+            db,
+            apply,
+        } => cmd_reconcile_plan(&plan, &root, &db, apply),
         Commands::Heal { root, db } => cmd_heal(&root, &db),
         Commands::Doctor { root, db, plan } => cmd_doctor(&root, &db, &plan),
         Commands::CheckRules { db } => cmd_check_rules(&db),
@@ -1636,6 +1660,126 @@ fn cmd_reconcile(root: &Path, db: &Path) -> Result<()> {
     Ok(())
 }
 
+fn cmd_reconcile_plan(plan_path: &Path, root: &Path, db: &Path, apply: bool) -> Result<()> {
+    let mut graph = Graph::open(db).with_context(|| format!("opening graph at {:?}", db))?;
+    let plan_text = fs::read_to_string(plan_path)
+        .with_context(|| format!("reading plan at {:?}", plan_path))?;
+    let (mut plan, invalid_ids) = Plan::parse_strict("features", &plan_text);
+    let plan_relative = plan_path
+        .strip_prefix(root)
+        .unwrap_or(plan_path)
+        .to_string_lossy()
+        .to_string();
+    let states = graph.task_keys_with_state(&format!("{plan_relative}#"))?;
+    let report = plan_reconcile::reconcile(&plan_relative, &plan, &invalid_ids, &states);
+
+    if report.is_clean() {
+        println!("Plan and graph agree: every task key is stable and both directions are in sync.");
+        return Ok(());
+    }
+
+    for invalid in &report.invalid_ids {
+        println!(
+            "INVALID ID    line {}: {} (task is invisible to iteration until fixed)",
+            invalid.line_index + 1,
+            invalid.error
+        );
+    }
+    for id in &report.derived_ids {
+        println!("DERIVED ID    {id}: no explicit ` - id:` tag in the plan file");
+    }
+    let state_label =
+        |state: &Option<TaskState>| state.map(TaskState::as_str).unwrap_or("history only");
+    for migration in &report.migratable {
+        println!(
+            "LEGACY KEY    {} -> {} ({}, {})",
+            migration.old_key,
+            migration.new_key,
+            migration.description,
+            state_label(&migration.state)
+        );
+    }
+    for (key, state) in &report.orphaned {
+        println!(
+            "ORPHANED      {key} ({}): matches no current task; inspect before deciding",
+            state_label(state)
+        );
+    }
+    for id in &report.unmarked_done {
+        println!("UNMARKED DONE {id}: graph says Done, plan says [ ]");
+    }
+    for (id, state) in &report.marked_done_but_graph_disagrees {
+        println!(
+            "PLAN AHEAD    {id}: plan says [x], graph says {}",
+            state.as_str()
+        );
+    }
+
+    if !apply {
+        println!(
+            "\nDry run. `--apply` migrates legacy keys, persists id tags, and syncs done marks."
+        );
+        return Ok(());
+    }
+    if !report.invalid_ids.is_empty() {
+        bail!("fix invalid ids in the plan file before applying repairs");
+    }
+
+    // Applying mutates the plan file and durable task keys: hold the
+    // repository lease so this cannot race an iteration.
+    let _lease = lease::acquire(
+        &root.join(".foundry"),
+        &lease::default_owner(),
+        "reconcile-plan --apply",
+    )
+    .map_err(|refusal| anyhow::anyhow!("{refusal}"))?;
+
+    for migration in &report.migratable {
+        graph
+            .migrate_task_key(&migration.old_key, &migration.new_key)
+            .with_context(|| format!("migrating {}", migration.old_key))?;
+    }
+    let persisted = plan.persist_derived_ids();
+    for id in &report.unmarked_done {
+        plan.mark_done(id);
+    }
+    if !persisted.is_empty() || !report.unmarked_done.is_empty() {
+        fs::write(plan_path, plan.to_string())
+            .with_context(|| format!("writing plan to {:?}", plan_path))?;
+    }
+    graph
+        .index_plan(&plan_relative, &plan)
+        .context("reindexing plan after reconciliation")?;
+    graph
+        .record_event(&Event::PlanReconciled {
+            plan_path: plan_relative,
+            migrated_keys: report
+                .migratable
+                .iter()
+                .map(|m| KeyMigrationRecord {
+                    old_key: m.old_key.clone(),
+                    new_key: m.new_key.clone(),
+                })
+                .collect(),
+            persisted_ids: persisted.iter().map(|id| id.to_string()).collect(),
+        })
+        .context("recording plan reconciliation event")?;
+
+    println!(
+        "\nApplied: {} key migration(s), {} id tag(s) persisted, {} done mark(s) synced.",
+        report.migratable.len(),
+        persisted.len(),
+        report.unmarked_done.len()
+    );
+    if !report.orphaned.is_empty() {
+        println!(
+            "Left alone: {} orphaned key(s) — deletion is a human decision.",
+            report.orphaned.len()
+        );
+    }
+    Ok(())
+}
+
 fn reconcile_state(root: &Path, db: &Path) -> Result<(bool, Vec<String>, Vec<String>)> {
     let graph = Graph::open(db).with_context(|| format!("opening graph at {:?}", db))?;
 
@@ -2287,14 +2431,55 @@ fn cmd_iterate(
 
     let plan_text = fs::read_to_string(plan_path)
         .with_context(|| format!("reading plan at {:?}", plan_path))?;
-    let mut plan = Plan::parse("bootstrap", &plan_text);
+    let (mut plan, invalid_ids) = Plan::parse_strict("bootstrap", &plan_text);
+    if !invalid_ids.is_empty() {
+        bail!(
+            "plan has invalid task ids:\n  - {}\nFix the ` - id:` tags before iterating.",
+            invalid_ids
+                .iter()
+                .map(|i| format!("line {}: {}", i.line_index + 1, i.error))
+                .collect::<Vec<_>>()
+                .join("\n  - ")
+        );
+    }
 
-    // Index the plan so task nodes exist in the graph and are linked to code.
     let plan_relative = plan_path
         .strip_prefix(root)
         .unwrap_or(plan_path)
         .to_string_lossy()
         .to_string();
+
+    // Refuse to fork history: if the graph still holds state under legacy
+    // positional keys for this plan, new runs would silently start fresh
+    // histories beside the old ones.
+    let states = graph.task_keys_with_state(&format!("{plan_relative}#"))?;
+    let report = plan_reconcile::reconcile(&plan_relative, &plan, &invalid_ids, &states);
+    if !report.migratable.is_empty() {
+        bail!(
+            "the graph holds task history under {} legacy positional key(s) for this plan.\n\
+             Run `foundry reconcile-plan --plan {} --apply` first.",
+            report.migratable.len(),
+            plan_path.display()
+        );
+    }
+
+    // Derived ids are stable, but explicit ones survive description edits.
+    // Persist them the same way approved done-marks are persisted below.
+    let persisted = plan.persist_derived_ids();
+    if !persisted.is_empty() {
+        fs::write(plan_path, plan.to_string())
+            .with_context(|| format!("persisting task ids to {plan_path:?}"))?;
+        println!(
+            "Persisted stable id tag(s) into the plan: {}",
+            persisted
+                .iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+
+    // Index the plan so task nodes exist in the graph and are linked to code.
     graph
         .index_plan(&plan_relative, &plan)
         .with_context(|| format!("indexing plan {}", plan_relative))?;
@@ -3277,7 +3462,7 @@ fn cmd_propose(
                     .rev()
                     .take(appended_count)
                     .rev()
-                    .map(|t| t.id.clone())
+                    .map(|t| t.id.to_string())
                     .collect();
                 let plan_relative = plan_path
                     .strip_prefix(root)

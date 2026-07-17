@@ -113,6 +113,21 @@ pub enum Event {
         quarantined: usize,
         orphan_blobs_removed: usize,
     },
+    /// `reconcile-plan --apply` repaired plan/graph identity: legacy
+    /// positional task keys were migrated to stable ids and/or derived
+    /// ids were persisted into the plan file as explicit tags.
+    PlanReconciled {
+        plan_path: String,
+        migrated_keys: Vec<KeyMigrationRecord>,
+        persisted_ids: Vec<String>,
+    },
+}
+
+/// One durable task-key rename applied by plan reconciliation.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct KeyMigrationRecord {
+    pub old_key: String,
+    pub new_key: String,
 }
 
 /// Serde mirror of a digest-boundary repair. Foundry-core stays free of the
@@ -172,6 +187,7 @@ impl Event {
             Event::ModelOutputDigested { .. } => "model_output_digested",
             Event::EvidenceErased { .. } => "evidence_erased",
             Event::RetentionSwept { .. } => "retention_swept",
+            Event::PlanReconciled { .. } => "plan_reconciled",
         }
     }
 }

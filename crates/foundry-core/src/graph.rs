@@ -262,6 +262,10 @@ pub enum GraphError {
     ChecksumMismatch { version: i64 },
     #[error("unknown migration version {version} with no known migration content")]
     UnknownMigration { version: i64 },
+    #[error(
+        "cannot migrate task key {old_key:?} to {new_key:?}: the target already has lifecycle state"
+    )]
+    TaskKeyMigrationConflict { old_key: String, new_key: String },
     #[error("corrupt stored event: {detail}")]
     CorruptStoredEvent { detail: String },
     #[error("lost the race transitioning {key}: it no longer holds state {expected}")]
@@ -639,6 +643,86 @@ impl Graph {
         let id = turn.id;
         self.record_discourse_turn(&turn)?;
         Ok(id)
+    }
+
+    /// Every task key with durable history under the given plan prefix
+    /// (`"plans/foo.plan.md#"`). The state is `None` for keys that appear
+    /// in history tables (jobs, reviews, drafts, resolutions) without a
+    /// lifecycle row — raw repairs have produced exactly that shape, and
+    /// reconciliation must see those keys too. Read model for plan/graph
+    /// reconciliation; requires no SQL from operators.
+    pub fn task_keys_with_state(
+        &self,
+        plan_prefix: &str,
+    ) -> Result<Vec<(String, Option<TaskState>)>, GraphError> {
+        let pattern = format!("{}%", plan_prefix.replace('%', "\\%").replace('_', "\\_"));
+        let mut statement = self.conn.prepare(
+            "SELECT keys.task_key, task_states.state FROM (
+                 SELECT task_key FROM task_states
+                 UNION SELECT task_key FROM jobs
+                 UNION SELECT task_key FROM reviews
+                 UNION SELECT task_key FROM review_drafts
+                 UNION SELECT task_key FROM review_resolutions
+             ) AS keys
+             LEFT JOIN task_states ON task_states.task_key = keys.task_key
+             WHERE keys.task_key LIKE ?1 ESCAPE '\\' ORDER BY keys.task_key",
+        )?;
+        let rows = statement
+            .query_map(params![pattern], |row| {
+                let key: String = row.get(0)?;
+                let state = row
+                    .get::<_, Option<String>>(1)?
+                    .map(parse_task_state)
+                    .transpose()?;
+                Ok((key, state))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Re-key a task's durable history: lifecycle state, jobs, reviews,
+    /// review drafts, and review resolutions all move from `old_key` to
+    /// `new_key` in one transaction. Refuses when the target already has
+    /// history in any of those tables (two histories must never merge
+    /// silently). Events are append-only history and keep the ids that
+    /// were true when they were recorded. Task *nodes* are derived and
+    /// re-keyed by the next `index_plan`.
+    pub fn migrate_task_key(&mut self, old_key: &str, new_key: &str) -> Result<(), GraphError> {
+        let transaction = self.conn.transaction()?;
+        let target_exists: bool = transaction
+            .query_row(
+                "SELECT 1 FROM (
+                     SELECT task_key FROM task_states
+                     UNION SELECT task_key FROM jobs
+                     UNION SELECT task_key FROM reviews
+                     UNION SELECT task_key FROM review_drafts
+                     UNION SELECT task_key FROM review_resolutions
+                 ) WHERE task_key = ?1",
+                params![new_key],
+                |_| Ok(true),
+            )
+            .optional()?
+            .unwrap_or(false);
+        if target_exists {
+            return Err(GraphError::TaskKeyMigrationConflict {
+                old_key: old_key.to_string(),
+                new_key: new_key.to_string(),
+            });
+        }
+        for table in [
+            "task_states",
+            "jobs",
+            "reviews",
+            "review_drafts",
+            "review_resolutions",
+        ] {
+            transaction.execute(
+                &format!("UPDATE {table} SET task_key = ?1 WHERE task_key = ?2"),
+                params![new_key, old_key],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
     }
 
     /// Initialize a durable task lifecycle. Repeating the operation is idempotent.
@@ -2674,6 +2758,98 @@ mod tests {
             graph
                 .validate_review_binding("task-a", JobId(Uuid::new_v4()))
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn migrate_task_key_moves_all_durable_history_and_refuses_conflicts() {
+        let mut graph = Graph::open_in_memory().unwrap();
+        let old_key = "plans/f.plan.md#task-3";
+        let new_key = "plans/f.plan.md#cap-runner-output";
+        graph
+            .initialize_task_state(old_key, TaskState::Ready)
+            .unwrap();
+        let job = graph.create_job(old_key, "migrate-1").unwrap();
+        let job_id = job.id.0.to_string();
+        for (table, sql) in [
+            (
+                "reviews",
+                "INSERT INTO reviews (id, task_key, job_id, decision, reviewer, reason, created_at)
+                 VALUES ('r1', ?1, ?2, 'approve', 'megloff1', 'ok', '2026-07-17')",
+            ),
+            (
+                "review_drafts",
+                "INSERT INTO review_drafts
+                     (id, task_key, job_id, perspective, recommendation, body, agent, created_at)
+                 VALUES ('d1', ?1, ?2, 'evidence', 'approve', 'body', 'm', '2026-07-17')",
+            ),
+            (
+                "review_resolutions",
+                "INSERT INTO review_resolutions
+                     (id, task_key, job_id, selected_draft_id, edit_similarity,
+                      final_body, decision, reviewer, created_at)
+                 VALUES ('res1', ?1, ?2, NULL, 0.5, 'final', 'approve', 'megloff1', '2026-07-17')",
+            ),
+        ] {
+            graph
+                .conn
+                .execute(sql, params![old_key, job_id])
+                .unwrap_or_else(|e| panic!("seeding {table}: {e}"));
+        }
+
+        graph.migrate_task_key(old_key, new_key).unwrap();
+
+        assert_eq!(
+            graph.task_state(new_key).unwrap(),
+            Some(TaskState::Ready),
+            "lifecycle state moved"
+        );
+        assert_eq!(graph.task_state(old_key).unwrap(), None);
+        for table in ["jobs", "reviews", "review_drafts", "review_resolutions"] {
+            let count: i64 = graph
+                .conn
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE task_key = ?1"),
+                    params![new_key],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 1, "{table} must reference the new key");
+            let stale: i64 = graph
+                .conn
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE task_key = ?1"),
+                    params![old_key],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(stale, 0, "{table} must not reference the old key");
+        }
+        assert_eq!(
+            graph
+                .job_by_idempotency_key("migrate-1")
+                .unwrap()
+                .unwrap()
+                .task_key,
+            new_key
+        );
+        let _ = job;
+
+        // A second history under the old key must never merge into the
+        // migrated one.
+        graph
+            .initialize_task_state(old_key, TaskState::Ready)
+            .unwrap();
+        match graph.migrate_task_key(old_key, new_key) {
+            Err(GraphError::TaskKeyMigrationConflict { .. }) => {}
+            other => panic!("expected TaskKeyMigrationConflict, got {other:?}"),
+        }
+
+        // Listing by prefix sees both, escaped LIKE and all.
+        let keys = graph.task_keys_with_state("plans/f.plan.md#").unwrap();
+        assert_eq!(
+            keys.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(),
+            vec![new_key, old_key],
         );
     }
 
