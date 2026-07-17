@@ -33,15 +33,17 @@ jobs:
         uses: actions/checkout@v6
         with:
           repository: Polysemic-Systems/polysemic
+          ref: 6294bf80c85c7da33360a4e3bfd00dd962da7710
           path: polysemic
 
       # The TDD vertical-slice tests exercise real Bubblewrap isolation.
       # Ubuntu 24.04 restricts unprivileged user namespaces via AppArmor by
       # default; relax it for the runner so bwrap can create its sandbox.
-      - name: Install Bubblewrap for agent-isolation tests
+      # ripgrep: check-source-policies.sh fails closed without it.
+      - name: Install Bubblewrap for agent-isolation tests and ripgrep for gate scripts
         run: |
           sudo apt-get update
-          sudo apt-get install -y bubblewrap
+          sudo apt-get install -y bubblewrap ripgrep
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
 
       - name: Install the pinned toolchain
@@ -53,14 +55,6 @@ jobs:
         with:
           workspaces: foundry
 
-      - name: Check formatting
+      - name: Run the authoritative repository gate
         working-directory: foundry
-        run: cargo fmt --all -- --check
-
-      - name: Lint with clippy
-        working-directory: foundry
-        run: cargo clippy --workspace --all-targets -- -D warnings
-
-      - name: Run tests
-        working-directory: foundry
-        run: cargo test --workspace
+        run: ./scripts/gate-full.sh
