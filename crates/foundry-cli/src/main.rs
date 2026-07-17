@@ -18,6 +18,7 @@ use walkdir::WalkDir;
 mod agent_sandbox;
 mod attempt;
 mod digest_boundary;
+mod lease;
 mod promotion;
 mod review_policy;
 mod runner;
@@ -91,6 +92,12 @@ enum Commands {
         /// Emit the report as JSON.
         #[arg(long)]
         json: bool,
+    },
+    /// Show whether an iteration currently holds the repository lease.
+    Lease {
+        /// Project root containing .foundry/.
+        #[arg(long, default_value = ".")]
+        root: PathBuf,
     },
     /// Approve successful job evidence and complete its task.
     ReviewApprove {
@@ -378,7 +385,25 @@ fn main() -> Result<()> {
             evidence_retention_days,
             command,
         }),
-        Commands::Sweep { db, enforce, json } => sweep::run_sweep(&db, enforce, json),
+        Commands::Sweep { db, enforce, json } => {
+            // An enforcing sweep deletes evidence; hold the repository lease so
+            // it cannot race a concurrent iteration's job runs (sweep.rs D7).
+            let _lease = if enforce {
+                let foundry_dir = db
+                    .parent()
+                    .filter(|dir| !dir.as_os_str().is_empty())
+                    .unwrap_or_else(|| Path::new("."))
+                    .to_path_buf();
+                Some(
+                    lease::acquire(&foundry_dir, &lease::default_owner(), "sweep --enforce")
+                        .map_err(|refusal| anyhow::anyhow!("{refusal}"))?,
+                )
+            } else {
+                None
+            };
+            sweep::run_sweep(&db, enforce, json)
+        }
+        Commands::Lease { root } => cmd_lease(&root),
         Commands::ReviewApprove {
             root,
             db,
@@ -2231,6 +2256,16 @@ fn cmd_heal(root: &Path, db: &Path) -> Result<()> {
     }
 }
 
+fn cmd_lease(root: &Path) -> Result<()> {
+    match lease::inspect(&root.join(".foundry"))? {
+        lease::LeaseStatus::Held(Some(info)) => println!("Lease held by {info}"),
+        lease::LeaseStatus::Held(None) => println!("Lease held (holder recorded no metadata)"),
+        lease::LeaseStatus::Free(Some(info)) => println!("Lease free (last held by {info})"),
+        lease::LeaseStatus::Free(None) => println!("Lease free"),
+    }
+    Ok(())
+}
+
 fn cmd_iterate(
     plan_path: &Path,
     root: &Path,
@@ -2239,6 +2274,15 @@ fn cmd_iterate(
     agent_command: Option<&str>,
     debug_runner: bool,
 ) -> Result<()> {
+    // Held until this iteration exits, by any path. The OS releases it if the
+    // process dies, so there is no stale-lease recovery to operate.
+    let _lease = lease::acquire(
+        &root.join(".foundry"),
+        &lease::default_owner(),
+        if tdd { "iterate --tdd" } else { "iterate" },
+    )
+    .map_err(|refusal| anyhow::anyhow!("{refusal}"))?;
+
     let mut graph = Graph::open(db).with_context(|| format!("opening graph at {:?}", db))?;
 
     let plan_text = fs::read_to_string(plan_path)
