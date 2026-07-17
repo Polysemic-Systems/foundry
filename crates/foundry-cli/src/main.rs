@@ -305,6 +305,10 @@ enum Commands {
         /// Print the effective sandbox configuration and run a toolchain preflight.
         #[arg(long)]
         debug_runner: bool,
+        /// Refuse to run an acceptance check that has never been observed
+        /// failing (plain mode always is); use --tdd to satisfy this.
+        #[arg(long)]
+        require_falsified: bool,
     },
     /// Propose a new feature. Foundry discusses it with you, then appends approved tasks to the plan.
     Propose {
@@ -401,6 +405,7 @@ fn main() -> Result<()> {
             workspace_baseline: None,
             staged: false,
             evidence_retention_days,
+            acceptance_authority: None,
             command,
         }),
         Commands::Sweep { db, enforce, json } => {
@@ -505,6 +510,7 @@ fn main() -> Result<()> {
             tdd,
             agent_command,
             debug_runner,
+            require_falsified,
         } => cmd_iterate(
             &plan,
             &root,
@@ -512,6 +518,7 @@ fn main() -> Result<()> {
             tdd,
             agent_command.as_deref(),
             debug_runner,
+            require_falsified,
         ),
         Commands::Propose {
             query,
@@ -1116,6 +1123,10 @@ struct JobRunRequest {
     /// Opt this job's evidence into `DeleteAfter{now + N days}` instead of
     /// the default 30-day review policy; `foundry sweep --enforce` collects it.
     evidence_retention_days: Option<i64>,
+    /// How the acceptance check earned authority (see
+    /// `foundry_core::acceptance_authority`); `None` when the caller
+    /// cannot know (direct `job-run`).
+    acceptance_authority: Option<&'static str>,
     command: Vec<String>,
 }
 
@@ -1236,6 +1247,7 @@ fn cmd_job_run(request: JobRunRequest) -> Result<()> {
     result.duration_ms = output.duration_ms;
     result.change_set = Some(output.change_set);
     result.executor_image = Some(executor_image);
+    result.acceptance_authority = request.acceptance_authority.map(str::to_string);
     result.staged = request.staged;
     if spec.command.iter().any(|part| part == "test") {
         result.tests.push(TestResult {
@@ -2417,6 +2429,7 @@ fn cmd_iterate(
     tdd: bool,
     agent_command: Option<&str>,
     debug_runner: bool,
+    require_falsified: bool,
 ) -> Result<()> {
     // Held until this iteration exits, by any path. The OS releases it if the
     // process dies, so there is no stale-lease recovery to operate.
@@ -2554,6 +2567,20 @@ fn cmd_iterate(
         }
     };
 
+    // Falsifiability (dogfooding finding 12): plain iterate never observes
+    // the acceptance check failing, so a pass can be vacuous — the command
+    // may succeed against a workspace where the task was never implemented.
+    if !tdd {
+        if require_falsified {
+            bail!(
+                "task {} has an acceptance check that was never observed failing                  and --require-falsified is set.\n                 Run `foundry iterate --tdd` so the red phase proves the check can fail.",
+                task.id
+            );
+        }
+        println!("WARNING: this check has never been observed failing; a pass may be vacuous.");
+        println!("Evidence will be recorded as `unfalsified` and review drafts will surface it.");
+    }
+
     graph
         .record_event(&Event::TaskStarted {
             task_id: task_node_id,
@@ -2659,6 +2686,11 @@ fn cmd_iterate(
         workspace_baseline,
         staged: tdd,
         evidence_retention_days: None,
+        acceptance_authority: Some(if tdd {
+            foundry_core::job::acceptance_authority::RED_PHASE
+        } else {
+            foundry_core::job::acceptance_authority::UNFALSIFIED
+        }),
         command,
     })?;
     if let Some(path) = baseline_path
