@@ -20,11 +20,22 @@ const MAX_CAPTURE_BYTES: usize = 10 * 1024 * 1024;
 /// Content-complete evidence for every relevant regular file in a workspace.
 pub type WorkspaceSnapshot = BTreeMap<String, FileEvidence>;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamCapture {
+    pub text: String,
+    pub truncated: bool,
+    pub dropped_bytes: usize,
+}
+
 #[derive(Debug)]
 pub struct RunnerOutput {
     pub exit_code: Option<i32>,
     pub stdout: String,
+    pub stdout_truncated: bool,
+    pub stdout_dropped_bytes: usize,
     pub stderr: String,
+    pub stderr_truncated: bool,
+    pub stderr_dropped_bytes: usize,
     pub duration_ms: u64,
     pub timed_out: bool,
     pub cancelled: bool,
@@ -80,18 +91,22 @@ pub fn run_podman(
         thread::sleep(Duration::from_millis(50));
     };
 
-    let stdout = stdout_reader
+    let stdout_cap = stdout_reader
         .join()
         .map_err(|_| anyhow::anyhow!("stdout reader panicked"))??;
-    let stderr = stderr_reader
+    let stderr_cap = stderr_reader
         .join()
         .map_err(|_| anyhow::anyhow!("stderr reader panicked"))??;
     let after = snapshot_workspace(root)?;
     let change_set = compare_snapshots(&before, &after);
     Ok(RunnerOutput {
         exit_code: status.code(),
-        stdout,
-        stderr,
+        stdout: stdout_cap.text,
+        stdout_truncated: stdout_cap.truncated,
+        stdout_dropped_bytes: stdout_cap.dropped_bytes,
+        stderr: stderr_cap.text,
+        stderr_truncated: stderr_cap.truncated,
+        stderr_dropped_bytes: stderr_cap.dropped_bytes,
         duration_ms: started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
         timed_out,
         cancelled: was_cancelled,
@@ -309,7 +324,7 @@ pub fn sha256_digest(bytes: &[u8]) -> String {
     format!("sha256:{:x}", Sha256::digest(bytes))
 }
 
-fn read_all_limited(mut reader: impl Read, limit: usize) -> Result<String> {
+fn read_all_limited(mut reader: impl Read, limit: usize) -> Result<StreamCapture> {
     const CHUNK: usize = 8192;
     let mut kept = Vec::with_capacity(limit.min(CHUNK));
     let mut total: usize = 0;
@@ -330,12 +345,17 @@ fn read_all_limited(mut reader: impl Read, limit: usize) -> Result<String> {
     if total > limit {
         let prefix_end = truncate_to_char_boundary(&kept, limit);
         let dropped = total - prefix_end;
-        let mut result = String::with_capacity(prefix_end + 32);
-        result.push_str(&String::from_utf8_lossy(&kept[..prefix_end]));
-        result.push_str(&format!("[output truncated; {dropped} bytes dropped]\n"));
-        Ok(result)
+        Ok(StreamCapture {
+            text: String::from_utf8_lossy(&kept[..prefix_end]).into_owned(),
+            truncated: true,
+            dropped_bytes: dropped,
+        })
     } else {
-        Ok(String::from_utf8_lossy(&kept).into_owned())
+        Ok(StreamCapture {
+            text: String::from_utf8_lossy(&kept).into_owned(),
+            truncated: false,
+            dropped_bytes: 0,
+        })
     }
 }
 
@@ -484,46 +504,52 @@ mod tests {
     }
 
     // Capture-limit tests for the runner's stdout/stderr readers.
-    // These exercise `read_all_limited` and `MAX_CAPTURE_BYTES`, which the
-    // implementation must add to prevent a runaway job from exhausting memory.
+    // These exercise `read_all_limited` and `MAX_CAPTURE_BYTES`.  The helper
+    // must return structured per-stream evidence (text, truncated flag, and
+    // dropped-byte count) rather than splicing a human-readable marker into
+    // the captured text.
 
     use std::io::Cursor;
-
-    fn parse_dropped_count(output: &str) -> Option<usize> {
-        let prefix = "[output truncated; ";
-        let idx = output.rfind(prefix)?;
-        let rest = &output[idx + prefix.len()..];
-        let end = rest.find(" bytes dropped]")?;
-        rest[..end].parse().ok()
-    }
 
     #[test]
     fn capture_stream_within_limit_is_unmodified() {
         let input = "hello, world\n";
-        let output = read_all_limited(Cursor::new(input), 1024).unwrap();
-        assert_eq!(output, input);
+        let cap: StreamCapture = read_all_limited(Cursor::new(input), 1024).unwrap();
+        assert_eq!(cap.text, input);
         assert!(
-            parse_dropped_count(&output).is_none(),
-            "streams under the limit must not carry a truncation marker"
+            !cap.truncated,
+            "streams under the limit must not be flagged truncated"
+        );
+        assert_eq!(
+            cap.dropped_bytes, 0,
+            "streams under the limit must report zero dropped bytes"
+        );
+        assert!(
+            !cap.text.contains("[output truncated"),
+            "the captured text must not contain a truncation marker"
         );
     }
 
     #[test]
-    fn capture_stream_over_limit_appends_truncation_marker_with_dropped_count() {
+    fn capture_stream_over_limit_records_structured_truncation_not_text_marker() {
         let limit = 16;
         let input = "x".repeat(100);
-        let output = read_all_limited(Cursor::new(&input), limit).unwrap();
-        assert_eq!(&output[..limit], "x".repeat(limit));
-        assert!(
-            output.len() > limit,
-            "a truncation marker must be appended after the kept prefix"
-        );
+        let cap: StreamCapture = read_all_limited(Cursor::new(&input), limit).unwrap();
         assert_eq!(
-            parse_dropped_count(&output),
-            Some(input.len() - limit),
-            "the marker must record the exact number of dropped bytes"
+            cap.text,
+            "x".repeat(limit),
+            "only the prefix up to the limit is kept"
         );
-        assert!(output.ends_with(" bytes dropped]\n"));
+        assert!(cap.truncated, "the stream must be flagged as truncated");
+        assert_eq!(
+            cap.dropped_bytes,
+            input.len() - limit,
+            "the dropped-byte count must record exactly what was discarded"
+        );
+        assert!(
+            !cap.text.contains("[output truncated"),
+            "the captured text must not contain a truncation marker"
+        );
     }
 
     #[test]
@@ -531,18 +557,22 @@ mod tests {
         // Each Greek letter is two UTF-8 bytes, for a total of 14 bytes.
         let input = "αβγδεηθ";
         let limit = 3; // falls in the middle of the second character (β)
-        let output = read_all_limited(Cursor::new(input), limit).unwrap();
+        let cap: StreamCapture = read_all_limited(Cursor::new(input), limit).unwrap();
 
-        let prefix_end = output.find("[output truncated; ").unwrap_or(output.len());
         assert!(
-            input.is_char_boundary(prefix_end),
+            input.is_char_boundary(cap.text.len()),
             "truncation must not split a UTF-8 codepoint"
         );
-        assert_eq!(&output[..prefix_end], "α");
+        assert_eq!(cap.text, "α");
+        assert!(cap.truncated);
         assert_eq!(
-            parse_dropped_count(&output),
-            Some(input.len() - prefix_end),
+            cap.dropped_bytes,
+            input.len() - cap.text.len(),
             "dropped count must reflect the actual kept bytes"
+        );
+        assert!(
+            !cap.text.contains("[output truncated"),
+            "the captured text must not contain a truncation marker"
         );
     }
 
@@ -552,5 +582,31 @@ mod tests {
             MAX_CAPTURE_BYTES > 0,
             "the runner must define a named, non-zero byte limit"
         );
+    }
+
+    #[test]
+    fn runner_output_carries_truncated_flags_and_dropped_counts_per_stream() {
+        let change_set = ChangeSet {
+            base_revision: "sha256:".into(),
+            patch_digest: "sha256:".into(),
+            files: Vec::new(),
+        };
+        let output = RunnerOutput {
+            exit_code: Some(0),
+            stdout: "stdout text".into(),
+            stdout_truncated: true,
+            stdout_dropped_bytes: 7,
+            stderr: "stderr text".into(),
+            stderr_truncated: false,
+            stderr_dropped_bytes: 0,
+            duration_ms: 1,
+            timed_out: false,
+            cancelled: false,
+            change_set,
+        };
+        assert!(output.stdout_truncated);
+        assert_eq!(output.stdout_dropped_bytes, 7);
+        assert!(!output.stderr_truncated);
+        assert_eq!(output.stderr_dropped_bytes, 0);
     }
 }
