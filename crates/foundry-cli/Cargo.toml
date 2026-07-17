@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 
+[dev-dependencies]
+portable-pty = "0.9"
+
 [dependencies]
 foundry-core.workspace = true
 clap = { version = "4", features = ["derive", "env"] }
@@ -17,6 +20,7 @@ uuid = "1"
 ratatui = "0.29"
 crossterm = "0.28"
 sha2 = "0.10"
+shlex = "2"
 polysemic-digest.workspace = true
 polysemic-core.workspace = true
 lethe.workspace = true

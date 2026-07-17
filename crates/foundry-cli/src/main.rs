@@ -767,18 +767,11 @@ struct ReviewTuiOutcome {
     decision: ReviewDecision,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ReviewUiMode {
-    Browse,
-    Edit,
-}
-
 struct ReviewUiState {
     selected_panel: usize,
     selected_draft: Option<uuid::Uuid>,
     final_body: String,
     decision: ReviewDecision,
-    mode: ReviewUiMode,
     scroll: u16,
 }
 
@@ -787,7 +780,7 @@ fn run_review_terminal(
     prior_review: Option<&Review>,
 ) -> Result<ReviewTuiOutcome> {
     use crossterm::{
-        event::{self, Event as TerminalEvent, KeyCode, KeyEventKind, KeyModifiers},
+        event::{self, Event as TerminalEvent, KeyCode, KeyEventKind},
         execute,
         terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
     };
@@ -814,7 +807,6 @@ fn run_review_terminal(
         decision: prior_review
             .map(|review| review.decision)
             .unwrap_or(ReviewDecision::Reject),
-        mode: ReviewUiMode::Browse,
         scroll: 0,
     };
     let fixed_decision = prior_review.map(|review| review.decision);
@@ -883,21 +875,9 @@ fn run_review_terminal(
                     ReviewDecision::Reject => "REJECT",
                 };
                 let final_block = Block::default()
-                    .title(format!(
-                        " Human synthesis · {} · {} ",
-                        decision,
-                        if state.mode == ReviewUiMode::Edit {
-                            "EDITING"
-                        } else {
-                            "BROWSE"
-                        }
-                    ))
+                    .title(format!(" Human synthesis · {} ", decision))
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(if state.mode == ReviewUiMode::Edit {
-                        Color::Yellow
-                    } else {
-                        Color::Green
-                    }));
+                    .border_style(Style::default().fg(Color::Green));
                 frame.render_widget(
                     Paragraph::new(state.final_body.as_str())
                         .block(final_block)
@@ -905,9 +885,7 @@ fn run_review_terminal(
                     rows[2],
                 );
 
-                let help = if state.mode == ReviewUiMode::Edit {
-                    "Type to edit · Enter newline · Esc finish editing"
-                } else if fixed_decision.is_some() {
+                let help = if fixed_decision.is_some() {
                     "←/→ inquire · 1/2 engage partner · 0 synthesize blank · e edit · decision locked · ↑/↓ scroll · s save learning · q quit"
                 } else {
                     "←/→ inquire · 1/2 engage partner · 0 synthesize blank · e edit · a approve · r reject · ↑/↓ scroll · s answer · q quit"
@@ -922,20 +900,6 @@ fn run_review_terminal(
                 continue;
             };
             if key.kind != KeyEventKind::Press {
-                continue;
-            }
-            if state.mode == ReviewUiMode::Edit {
-                match key.code {
-                    KeyCode::Esc => state.mode = ReviewUiMode::Browse,
-                    KeyCode::Enter => state.final_body.push('\n'),
-                    KeyCode::Backspace => {
-                        state.final_body.pop();
-                    }
-                    KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        state.final_body.push(character);
-                    }
-                    _ => {}
-                }
                 continue;
             }
             match key.code {
@@ -960,7 +924,26 @@ fn run_review_terminal(
                     state.selected_draft = None;
                     state.final_body.clear();
                 }
-                KeyCode::Char('e') => state.mode = ReviewUiMode::Edit,
+                KeyCode::Char('e') => {
+                    disable_raw_mode()?;
+                    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+                    terminal.show_cursor()?;
+
+                    let edited = edit_in_external_editor(&state.final_body);
+                    if let Err(ref error) = edited {
+                        // Print while still in normal terminal mode so the
+                        // message is readable before the TUI redraws.
+                        eprintln!("editor failed: {error:#}");
+                    }
+
+                    enable_raw_mode()?;
+                    execute!(terminal.backend_mut(), EnterAlternateScreen)?;
+                    terminal.clear()?;
+
+                    if let Ok(body) = edited {
+                        state.final_body = body;
+                    }
+                }
                 KeyCode::Char('a') if fixed_decision.is_none() => {
                     state.decision = ReviewDecision::Approve
                 }
@@ -986,6 +969,67 @@ fn run_review_terminal(
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
     result
+}
+
+/// Suspend the TUI and open `$EDITOR` on a temporary copy of the draft.
+/// The caller is responsible for restoring the terminal after this returns.
+fn edit_in_external_editor(initial: &str) -> Result<String> {
+    let temp_dir = std::env::temp_dir().join(format!("foundry-review-{}", uuid::Uuid::new_v4()));
+    let temp_path = create_review_editor_draft(&temp_dir, initial)?;
+
+    let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".into());
+    let status = run_editor_command(&editor, &temp_path)
+        .with_context(|| format!("launching editor {editor}"))?;
+    if !status.success() {
+        eprintln!("warning: editor exited with {status}; using saved draft if any");
+    }
+
+    let edited = fs::read_to_string(&temp_path).context("reading edited review draft")?;
+    let _ = fs::remove_dir_all(&temp_dir);
+    Ok(edited)
+}
+
+fn create_review_editor_draft(temp_dir: &Path, initial: &str) -> Result<PathBuf> {
+    let mut directory = fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        directory.mode(0o700);
+    }
+    directory
+        .create(temp_dir)
+        .context("creating review editor temp dir")?;
+
+    let temp_path = temp_dir.join("draft.md");
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut draft = options
+        .open(&temp_path)
+        .context("creating review draft for editor")?;
+    draft
+        .write_all(initial.as_bytes())
+        .context("writing review draft for editor")?;
+    Ok(temp_path)
+}
+
+fn run_editor_command(editor: &str, path: &Path) -> Result<std::process::ExitStatus> {
+    let parts = shlex::split(editor).unwrap_or_else(|| {
+        editor
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    });
+    if parts.is_empty() {
+        bail!("$EDITOR is empty");
+    }
+    let mut command = Command::new(&parts[0]);
+    command.args(&parts[1..]).arg(path);
+    command.status().map_err(Into::into)
 }
 
 fn text_similarity(left: &str, right: &str) -> f64 {
@@ -1135,7 +1179,11 @@ fn cmd_job_run(request: JobRunRequest) -> Result<()> {
     result.spec = Some(spec.clone());
     result.exit_code = output.exit_code;
     result.stdout = output.stdout;
+    result.stdout_truncated = output.stdout_truncated;
+    result.stdout_dropped_bytes = output.stdout_dropped_bytes;
     result.stderr = output.stderr;
+    result.stderr_truncated = output.stderr_truncated;
+    result.stderr_dropped_bytes = output.stderr_dropped_bytes;
     result.duration_ms = output.duration_ms;
     result.change_set = Some(output.change_set);
     result.executor_image = Some(executor_image);
@@ -1755,7 +1803,23 @@ fn cmd_doctor(root: &Path, db: &Path, plan_path: &Path) -> Result<()> {
         Err(e) => checks.push(fail("events", format!("cannot read events: {}", e))),
     }
 
-    // 8. Required tools on PATH.
+    // 8. Orphaned evidence old enough for the sweep to collect.
+    match sweep::orphaned_blob_count(&graph) {
+        Ok(0) => checks.push(ok(
+            "orphaned_evidence",
+            "no orphaned evidence blobs older than the sweep age guard",
+        )),
+        Ok(count) => checks.push(warn(
+            "orphaned_evidence",
+            format!("{count} orphaned evidence blob(s) older than the sweep age guard"),
+        )),
+        Err(e) => checks.push(fail(
+            "orphaned_evidence",
+            format!("cannot scan evidence blobs: {e}"),
+        )),
+    }
+
+    // 9. Required tools on PATH.
     for tool in ["cargo", "just", "bwrap"] {
         if Command::new(tool).arg("--version").output().is_ok() {
             checks.push(ok(format!("tool_{}", tool), "found on PATH"));
@@ -1763,7 +1827,7 @@ fn cmd_doctor(root: &Path, db: &Path, plan_path: &Path) -> Result<()> {
             checks.push(fail(format!("tool_{}", tool), "not found on PATH"));
         }
     }
-    // 9. Optional local-model / network / sandbox tools.
+    // 10. Optional local-model / network / sandbox tools.
     for tool in ["ollama", "curl", "podman"] {
         if Command::new(tool).arg("--version").output().is_ok() {
             checks.push(ok(format!("tool_{}", tool), "found on PATH"));
@@ -3428,8 +3492,28 @@ fn is_ignored(path: &Path) -> bool {
 mod tests {
     use super::{
         CargoTestSummary, IterationFeedback, SOCRATIC_DISCOURSE_CONTRACT, cargo_test_summary,
-        feedback_prompt, infrastructure_failure_text, tail_chars, text_similarity,
+        create_review_editor_draft, feedback_prompt, infrastructure_failure_text, tail_chars,
+        text_similarity,
     };
+
+    #[cfg(unix)]
+    #[test]
+    fn review_editor_draft_is_private() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = std::env::temp_dir().join(format!(
+            "foundry-review-permissions-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let temp_path = create_review_editor_draft(&temp_dir, "private review notes").unwrap();
+        let dir_mode = fs::metadata(&temp_dir).unwrap().permissions().mode();
+        let file_mode = fs::metadata(&temp_path).unwrap().permissions().mode();
+        fs::remove_dir_all(&temp_dir).unwrap();
+
+        assert_eq!(dir_mode & 0o077, 0, "editor directory must be owner-only");
+        assert_eq!(file_mode & 0o077, 0, "editor draft must be owner-only");
+    }
 
     #[test]
     fn rejected_review_is_rendered_as_durable_agent_feedback() {

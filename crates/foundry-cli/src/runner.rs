@@ -14,14 +14,32 @@ use std::thread;
 use std::time::{Duration, Instant};
 use walkdir::WalkDir;
 
+/// Maximum bytes captured from a job's stdout/stderr before truncation.
+const MAX_CAPTURE_BYTES: usize = 10 * 1024 * 1024;
+const _: () = assert!(
+    MAX_CAPTURE_BYTES > 0,
+    "the runner must define a named, non-zero byte limit"
+);
+
 /// Content-complete evidence for every relevant regular file in a workspace.
 pub type WorkspaceSnapshot = BTreeMap<String, FileEvidence>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamCapture {
+    pub text: String,
+    pub truncated: bool,
+    pub dropped_bytes: usize,
+}
 
 #[derive(Debug)]
 pub struct RunnerOutput {
     pub exit_code: Option<i32>,
     pub stdout: String,
+    pub stdout_truncated: bool,
+    pub stdout_dropped_bytes: usize,
     pub stderr: String,
+    pub stderr_truncated: bool,
+    pub stderr_dropped_bytes: usize,
     pub duration_ms: u64,
     pub timed_out: bool,
     pub cancelled: bool,
@@ -53,8 +71,8 @@ pub fn run_podman(
 
     let stdout = child.stdout.take().context("capturing job stdout")?;
     let stderr = child.stderr.take().context("capturing job stderr")?;
-    let stdout_reader = thread::spawn(move || read_all(stdout));
-    let stderr_reader = thread::spawn(move || read_all(stderr));
+    let stdout_reader = thread::spawn(move || read_all_limited(stdout, MAX_CAPTURE_BYTES));
+    let stderr_reader = thread::spawn(move || read_all_limited(stderr, MAX_CAPTURE_BYTES));
     let timeout = Duration::from_secs(spec.timeout_seconds);
     let mut timed_out = false;
     let mut was_cancelled = false;
@@ -77,18 +95,22 @@ pub fn run_podman(
         thread::sleep(Duration::from_millis(50));
     };
 
-    let stdout = stdout_reader
+    let stdout_cap = stdout_reader
         .join()
         .map_err(|_| anyhow::anyhow!("stdout reader panicked"))??;
-    let stderr = stderr_reader
+    let stderr_cap = stderr_reader
         .join()
         .map_err(|_| anyhow::anyhow!("stderr reader panicked"))??;
     let after = snapshot_workspace(root)?;
     let change_set = compare_snapshots(&before, &after);
     Ok(RunnerOutput {
         exit_code: status.code(),
-        stdout,
-        stderr,
+        stdout: stdout_cap.text,
+        stdout_truncated: stdout_cap.truncated,
+        stdout_dropped_bytes: stdout_cap.dropped_bytes,
+        stderr: stderr_cap.text,
+        stderr_truncated: stderr_cap.truncated,
+        stderr_dropped_bytes: stderr_cap.dropped_bytes,
         duration_ms: started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
         timed_out,
         cancelled: was_cancelled,
@@ -306,10 +328,69 @@ pub fn sha256_digest(bytes: &[u8]) -> String {
     format!("sha256:{:x}", Sha256::digest(bytes))
 }
 
-fn read_all(mut reader: impl Read) -> Result<String> {
-    let mut bytes = Vec::new();
-    reader.read_to_end(&mut bytes)?;
-    Ok(String::from_utf8_lossy(&bytes).into_owned())
+fn read_all_limited(mut reader: impl Read, limit: usize) -> Result<StreamCapture> {
+    const CHUNK: usize = 8192;
+    let mut kept = Vec::with_capacity(limit.min(CHUNK));
+    let mut total: usize = 0;
+    let mut buf = [0u8; CHUNK];
+
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        total += n;
+        if kept.len() < limit {
+            let take = n.min(limit - kept.len());
+            kept.extend_from_slice(&buf[..take]);
+        }
+    }
+
+    if total > limit {
+        let prefix_end = truncate_to_char_boundary(&kept, limit);
+        let dropped = total - prefix_end;
+        Ok(StreamCapture {
+            text: String::from_utf8_lossy(&kept[..prefix_end]).into_owned(),
+            truncated: true,
+            dropped_bytes: dropped,
+        })
+    } else {
+        Ok(StreamCapture {
+            text: String::from_utf8_lossy(&kept).into_owned(),
+            truncated: false,
+            dropped_bytes: 0,
+        })
+    }
+}
+
+fn truncate_to_char_boundary(bytes: &[u8], limit: usize) -> usize {
+    let mut end = bytes.len().min(limit);
+    while end > 0 {
+        let start = utf8_char_start(bytes, end - 1);
+        let expected = utf8_char_len(bytes[start]);
+        if end - start == expected {
+            return end;
+        }
+        end = start;
+    }
+    0
+}
+
+fn utf8_char_start(bytes: &[u8], mut idx: usize) -> usize {
+    while idx > 0 && (bytes[idx] & 0b1100_0000) == 0b1000_0000 {
+        idx -= 1;
+    }
+    idx
+}
+
+fn utf8_char_len(leading: u8) -> usize {
+    match leading.leading_ones() as usize {
+        0 => 1,
+        2 => 2,
+        3 => 3,
+        4 => 4,
+        _ => 1, // invalid leading byte; treat as single byte
+    }
 }
 
 #[cfg(test)]
@@ -424,5 +505,104 @@ mod tests {
         assert!(changes.base_revision.starts_with("sha256:"));
         assert!(changes.patch_digest.starts_with("sha256:"));
         fs::remove_dir_all(root).unwrap();
+    }
+
+    // Capture-limit tests for the runner's stdout/stderr readers.
+    // These exercise `read_all_limited` and `MAX_CAPTURE_BYTES`.  The helper
+    // must return structured per-stream evidence (text, truncated flag, and
+    // dropped-byte count) rather than splicing a human-readable marker into
+    // the captured text.
+
+    use std::io::Cursor;
+
+    #[test]
+    fn capture_stream_within_limit_is_unmodified() {
+        let input = "hello, world\n";
+        let cap: StreamCapture = read_all_limited(Cursor::new(input), 1024).unwrap();
+        assert_eq!(cap.text, input);
+        assert!(
+            !cap.truncated,
+            "streams under the limit must not be flagged truncated"
+        );
+        assert_eq!(
+            cap.dropped_bytes, 0,
+            "streams under the limit must report zero dropped bytes"
+        );
+        assert!(
+            !cap.text.contains("[output truncated"),
+            "the captured text must not contain a truncation marker"
+        );
+    }
+
+    #[test]
+    fn capture_stream_over_limit_records_structured_truncation_not_text_marker() {
+        let limit = 16;
+        let input = "x".repeat(100);
+        let cap: StreamCapture = read_all_limited(Cursor::new(&input), limit).unwrap();
+        assert_eq!(
+            cap.text,
+            "x".repeat(limit),
+            "only the prefix up to the limit is kept"
+        );
+        assert!(cap.truncated, "the stream must be flagged as truncated");
+        assert_eq!(
+            cap.dropped_bytes,
+            input.len() - limit,
+            "the dropped-byte count must record exactly what was discarded"
+        );
+        assert!(
+            !cap.text.contains("[output truncated"),
+            "the captured text must not contain a truncation marker"
+        );
+    }
+
+    #[test]
+    fn capture_stream_truncation_respects_utf8_boundaries() {
+        // Each Greek letter is two UTF-8 bytes, for a total of 14 bytes.
+        let input = "αβγδεηθ";
+        let limit = 3; // falls in the middle of the second character (β)
+        let cap: StreamCapture = read_all_limited(Cursor::new(input), limit).unwrap();
+
+        assert!(
+            input.is_char_boundary(cap.text.len()),
+            "truncation must not split a UTF-8 codepoint"
+        );
+        assert_eq!(cap.text, "α");
+        assert!(cap.truncated);
+        assert_eq!(
+            cap.dropped_bytes,
+            input.len() - cap.text.len(),
+            "dropped count must reflect the actual kept bytes"
+        );
+        assert!(
+            !cap.text.contains("[output truncated"),
+            "the captured text must not contain a truncation marker"
+        );
+    }
+
+    #[test]
+    fn runner_output_carries_truncated_flags_and_dropped_counts_per_stream() {
+        let change_set = ChangeSet {
+            base_revision: "sha256:".into(),
+            patch_digest: "sha256:".into(),
+            files: Vec::new(),
+        };
+        let output = RunnerOutput {
+            exit_code: Some(0),
+            stdout: "stdout text".into(),
+            stdout_truncated: true,
+            stdout_dropped_bytes: 7,
+            stderr: "stderr text".into(),
+            stderr_truncated: false,
+            stderr_dropped_bytes: 0,
+            duration_ms: 1,
+            timed_out: false,
+            cancelled: false,
+            change_set,
+        };
+        assert!(output.stdout_truncated);
+        assert_eq!(output.stdout_dropped_bytes, 7);
+        assert!(!output.stderr_truncated);
+        assert_eq!(output.stderr_dropped_bytes, 0);
     }
 }

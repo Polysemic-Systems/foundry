@@ -16,6 +16,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
+const BLOB_SWEEP_MINIMUM_AGE: std::time::Duration = std::time::Duration::from_secs(3600);
+
 /// One governed result with a due disposition. Never carries content or
 /// file paths — job ids point into retained append-only history.
 #[derive(Debug, serde::Serialize)]
@@ -339,19 +341,16 @@ impl ErasureAdapter for BlobStoreAdapter {
     }
 }
 
-/// Remove blob objects no remaining result references. Catches the crash
-/// window between a row delete and its blob removal. The mtime guard keeps a
-/// concurrently finishing job's freshly externalized blobs safe.
-fn orphan_gc(graph: &Rc<RefCell<Graph>>, minimum_age: std::time::Duration) -> Result<usize> {
-    let Some(root) = graph.borrow().blob_store_root()? else {
-        return Ok(0);
+fn orphan_blob_paths(graph: &Graph, minimum_age: std::time::Duration) -> Result<Vec<PathBuf>> {
+    let Some(root) = graph.blob_store_root()? else {
+        return Ok(Vec::new());
     };
     if !root.exists() {
-        return Ok(0);
+        return Ok(Vec::new());
     }
-    let referenced = graph.borrow().referenced_blob_digests()?;
+    let referenced = graph.referenced_blob_digests()?;
     let now = std::time::SystemTime::now();
-    let mut removed = 0;
+    let mut orphans = Vec::new();
     for entry in std::fs::read_dir(&root).context("listing blob store")? {
         let entry = entry?;
         if !entry.file_type()?.is_file() {
@@ -373,8 +372,23 @@ fn orphan_gc(graph: &Rc<RefCell<Graph>>, minimum_age: std::time::Duration) -> Re
         if recent {
             continue;
         }
-        std::fs::remove_file(entry.path()).context("removing orphaned blob")?;
-        removed += 1;
+        orphans.push(entry.path());
+    }
+    Ok(orphans)
+}
+
+pub(crate) fn orphaned_blob_count(graph: &Graph) -> Result<usize> {
+    Ok(orphan_blob_paths(graph, BLOB_SWEEP_MINIMUM_AGE)?.len())
+}
+
+/// Remove blob objects no remaining result references. Catches the crash
+/// window between a row delete and its blob removal. The mtime guard keeps a
+/// concurrently finishing job's freshly externalized blobs safe.
+fn orphan_gc(graph: &Rc<RefCell<Graph>>, minimum_age: std::time::Duration) -> Result<usize> {
+    let orphans = orphan_blob_paths(&graph.borrow(), minimum_age)?;
+    let removed = orphans.len();
+    for path in orphans {
+        std::fs::remove_file(path).context("removing orphaned blob")?;
     }
     Ok(removed)
 }
@@ -446,7 +460,7 @@ pub fn run_sweep(db: &Path, enforce: bool, json: bool) -> Result<()> {
             graph: Rc::clone(&graph),
             root,
             manifests,
-            minimum_age: std::time::Duration::from_secs(3600),
+            minimum_age: BLOB_SWEEP_MINIMUM_AGE,
         }),
     ])
     .map_err(|error| anyhow::anyhow!("building erasure coordinator: {error:?}"))?;
@@ -496,7 +510,7 @@ pub fn run_sweep(db: &Path, enforce: bool, json: bool) -> Result<()> {
         receipts.push((subject, status.to_string(), report.receipt));
     }
 
-    let orphan_blobs_removed = orphan_gc(&graph, std::time::Duration::from_secs(3600))?;
+    let orphan_blobs_removed = orphan_gc(&graph, BLOB_SWEEP_MINIMUM_AGE)?;
 
     graph
         .borrow_mut()

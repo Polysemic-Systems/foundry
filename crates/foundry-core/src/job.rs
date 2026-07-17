@@ -287,7 +287,15 @@ pub struct JobResult {
     pub spec: Option<JobSpec>,
     pub exit_code: Option<i32>,
     pub stdout: String,
+    #[serde(default)]
+    pub stdout_truncated: bool,
+    #[serde(default)]
+    pub stdout_dropped_bytes: usize,
     pub stderr: String,
+    #[serde(default)]
+    pub stderr_truncated: bool,
+    #[serde(default)]
+    pub stderr_dropped_bytes: usize,
     pub duration_ms: u64,
     pub artifacts: Vec<Artifact>,
     pub tests: Vec<TestResult>,
@@ -319,7 +327,11 @@ impl JobResult {
             spec: None,
             exit_code: None,
             stdout: String::new(),
+            stdout_truncated: false,
+            stdout_dropped_bytes: 0,
             stderr: String::new(),
+            stderr_truncated: false,
+            stderr_dropped_bytes: 0,
             duration_ms: 0,
             artifacts: Vec::new(),
             tests: Vec::new(),
@@ -448,6 +460,54 @@ mod tests {
         let result = JobResult::new(JobId::new(), JobState::Succeeded, governance()).unwrap();
         let json = serde_json::to_string(&result).unwrap();
         assert_eq!(serde_json::from_str::<JobResult>(&json).unwrap(), result);
+    }
+
+    #[test]
+    fn job_result_carries_truncated_flags_and_dropped_counts_per_stream() {
+        let mut result = JobResult::new(JobId::new(), JobState::Succeeded, governance()).unwrap();
+        result.stdout = "stdout".into();
+        result.stdout_truncated = true;
+        result.stdout_dropped_bytes = 42;
+        result.stderr = "stderr".into();
+        result.stderr_truncated = false;
+        result.stderr_dropped_bytes = 0;
+
+        assert!(result.stdout_truncated);
+        assert_eq!(result.stdout_dropped_bytes, 42);
+        assert!(!result.stderr_truncated);
+        assert_eq!(result.stderr_dropped_bytes, 0);
+
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(json.contains("stdout_truncated"));
+        assert!(json.contains("stdout_dropped_bytes"));
+        assert!(json.contains("stderr_truncated"));
+        assert!(json.contains("stderr_dropped_bytes"));
+
+        let round_trip: JobResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(round_trip, result);
+    }
+
+    #[test]
+    fn job_result_defaults_truncation_fields_for_legacy_records() {
+        let mut result = JobResult::new(JobId::new(), JobState::Succeeded, governance()).unwrap();
+        result.stdout = "legacy stdout".into();
+        result.stderr = "legacy stderr".into();
+
+        let mut value = serde_json::to_value(&result).unwrap();
+        let obj = value.as_object_mut().unwrap();
+        obj.remove("stdout_truncated");
+        obj.remove("stdout_dropped_bytes");
+        obj.remove("stderr_truncated");
+        obj.remove("stderr_dropped_bytes");
+        let legacy_json = serde_json::to_string(&value).unwrap();
+
+        let parsed: JobResult = serde_json::from_str(&legacy_json).unwrap();
+        assert_eq!(parsed.stdout, "legacy stdout");
+        assert_eq!(parsed.stderr, "legacy stderr");
+        assert!(!parsed.stdout_truncated);
+        assert_eq!(parsed.stdout_dropped_bytes, 0);
+        assert!(!parsed.stderr_truncated);
+        assert_eq!(parsed.stderr_dropped_bytes, 0);
     }
 
     #[test]

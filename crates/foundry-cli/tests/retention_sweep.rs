@@ -2,7 +2,10 @@
 //! DeleteAfter policy is erased through the lethe erasure contract; retained
 //! evidence, append-only history, and mid-review tasks are untouched.
 
-use foundry_core::{Event, Graph, JobId, JobResult, RetentionPolicy};
+use foundry_core::{
+    ChangeSet, ChangeStatus, ChangedFile, Event, FileEvidence, GovernanceEnvelope, Graph, JobId,
+    JobResult, JobState, KnowledgeLayer, RetentionPolicy, SourceRef, Transformation,
+};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
@@ -265,6 +268,113 @@ fn sweep_erases_only_due_evidence_and_leaves_receipts() {
         .count();
     assert_eq!(sweep_events, 2);
     drop(graph);
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn doctor_warns_only_for_orphaned_blobs_older_than_the_sweep_age_guard() {
+    let root = std::env::temp_dir().join(format!("foundry-doctor-blobs-{}", uuid::Uuid::new_v4()));
+    let db_dir = root.join(".foundry");
+    fs::create_dir_all(&db_dir).unwrap();
+    let db = db_dir.join("db.sqlite");
+
+    // This result gives doctor an old on-disk object that must remain healthy
+    // because the graph's referenced-digest scan still finds it.
+    use sha2::Digest as _;
+    let mut graph = Graph::open(&db).unwrap();
+    let job = graph
+        .create_job("plans/test.plan.md#doctor-live", "doctor-live")
+        .unwrap();
+    graph.transition_job(job.id, JobState::Running).unwrap();
+    graph.transition_job(job.id, JobState::Succeeded).unwrap();
+    let evidence = b"referenced evidence";
+    let digest = format!("sha256:{:x}", sha2::Sha256::digest(evidence));
+    let governance = GovernanceEnvelope {
+        layer: KnowledgeLayer::Observed,
+        sources: vec![SourceRef {
+            uri: "job://doctor-live/output".into(),
+            digest: None,
+        }],
+        assumptions: Vec::new(),
+        transformation: Transformation {
+            name: "capture-job-result".into(),
+            version: "1".into(),
+            input_digests: Vec::new(),
+        },
+        owner: "doctor-test".into(),
+        retention: RetentionPolicy::Preserve {
+            basis: "reference-scan regression fixture".into(),
+        },
+    };
+    let mut result = JobResult::new(job.id, JobState::Succeeded, governance).unwrap();
+    result.change_set = Some(ChangeSet {
+        base_revision: "sha256:base".into(),
+        patch_digest: "sha256:patch".into(),
+        files: vec![ChangedFile {
+            path: "live.txt".into(),
+            status: ChangeStatus::Added,
+            before: None,
+            after: Some(FileEvidence {
+                digest: digest.clone(),
+                bytes: evidence.to_vec(),
+                blob: None,
+                executable: false,
+            }),
+        }],
+    });
+    graph.record_job_result(&result).unwrap();
+    let referenced_name = digest.strip_prefix("sha256:").unwrap().to_owned();
+    let blob_root = graph.blob_store_root().unwrap().unwrap();
+    drop(graph);
+
+    let referenced = blob_root.join(referenced_name);
+    let old_orphan = blob_root.join("f".repeat(64));
+    let young_orphan = blob_root.join("e".repeat(64));
+    fs::write(&old_orphan, b"old orphan").unwrap();
+    fs::write(&young_orphan, b"young orphan").unwrap();
+    for path in [&referenced, &old_orphan] {
+        let aged = Command::new("touch")
+            .args(["-d", "2 hours ago"])
+            .arg(path)
+            .status()
+            .unwrap();
+        assert!(aged.success());
+    }
+
+    let doctor = Command::new(env!("CARGO_BIN_EXE_foundry-cli"))
+        .args([
+            "doctor",
+            "--root",
+            root.to_str().unwrap(),
+            "--db",
+            db.to_str().unwrap(),
+            "--plan",
+            root.join("plans/test.plan.md").to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8(doctor.stdout).unwrap();
+    let orphan_warning = stdout
+        .lines()
+        .find(|line| line.starts_with("[WARN]") && line.contains("orphan"))
+        .unwrap_or_else(|| panic!("doctor did not warn about orphaned evidence blobs:\n{stdout}"));
+    assert!(
+        orphan_warning.contains("1 orphaned"),
+        "only the old unreferenced blob should be counted: {orphan_warning}"
+    );
+    assert!(
+        referenced.exists(),
+        "doctor must not remove referenced evidence"
+    );
+    assert!(
+        young_orphan.exists(),
+        "doctor must not remove a fresh orphan"
+    );
+    assert!(
+        old_orphan.exists(),
+        "doctor reports but does not sweep orphans"
+    );
 
     fs::remove_dir_all(root).unwrap();
 }
