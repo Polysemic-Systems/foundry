@@ -359,6 +359,10 @@ pub mod acceptance_authority {
     /// The TDD red phase demonstrated this check failing before the
     /// green phase made it pass.
     pub const RED_PHASE: &str = "red-phase-observed-failing";
+    /// A failed TDD task was repaired or re-verified in a later process
+    /// without replaying and preserving the original red proof. The final
+    /// pass is real, but it cannot inherit red-phase authority by assertion.
+    pub const RETRY_WITHOUT_RED: &str = "retry-without-observed-red-phase";
     /// The check was never observed failing (plain `iterate`): a pass
     /// may be vacuous — it can succeed against a workspace where the
     /// task was never implemented.

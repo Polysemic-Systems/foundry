@@ -1,4 +1,7 @@
-use crate::runner::{patch_digest, sha256_digest};
+use crate::{
+    lease::RepositoryMutation,
+    runner::{patch_digest, sha256_digest},
+};
 use anyhow::{Context, Result, bail};
 use foundry_core::{ChangeSet, ChangeStatus, FileEvidence};
 use serde::{Deserialize, Serialize};
@@ -44,7 +47,7 @@ struct PromotionJournal {
 ///
 /// The operation is idempotent: files already matching their recorded
 /// after-state are accepted, which makes a review retry safe after interruption.
-pub fn apply_change_set(root: &Path, change_set: &ChangeSet) -> Result<()> {
+pub fn apply_change_set(mutation: &RepositoryMutation, change_set: &ChangeSet) -> Result<()> {
     let calculated_patch = patch_digest(&change_set.files);
     if calculated_patch != change_set.patch_digest {
         bail!(
@@ -52,11 +55,9 @@ pub fn apply_change_set(root: &Path, change_set: &ChangeSet) -> Result<()> {
             change_set.patch_digest
         );
     }
-    let root = root
-        .canonicalize()
-        .with_context(|| format!("resolving promotion root {}", root.display()))?;
-    let _lock = acquire_promotion_lock(&root)?;
-    recover_incomplete_promotions(&root)?;
+    let root = mutation.root();
+    let _lock = acquire_promotion_lock(root)?;
+    recover_incomplete_promotions(root)?;
     let mut pending = Vec::new();
 
     for change in &change_set.files {
@@ -68,7 +69,7 @@ pub fn apply_change_set(root: &Path, change_set: &ChangeSet) -> Result<()> {
             validate_blob(evidence, &change.path, "after")?;
         }
 
-        let target = safe_target(&root, &change.path)?;
+        let target = safe_target(root, &change.path)?;
         let current = read_evidence(&target)?;
         if current.as_ref() == change.after.as_ref() {
             continue;
@@ -90,13 +91,18 @@ pub fn apply_change_set(root: &Path, change_set: &ChangeSet) -> Result<()> {
     if pending.is_empty() {
         return Ok(());
     }
-    let (transaction, mut journal) = prepare_transaction(&root, &pending)?;
+    let (transaction, mut journal) = prepare_transaction(root, &pending)?;
+    tracing::info!(
+        transaction = %transaction.display(),
+        changed_files = journal.entries.len(),
+        "prepared workspace promotion"
+    );
     journal.state = JournalState::Committing;
     persist_journal(&transaction, &journal)?;
 
-    let commit = commit_transaction(&root, &transaction, &journal);
+    let commit = commit_transaction(root, &transaction, &journal);
     if let Err(error) = commit {
-        rollback_transaction(&root, &transaction, &journal)
+        rollback_transaction(root, &transaction, &journal)
             .context("rolling back failed promotion")?;
         return Err(error);
     }
@@ -105,6 +111,10 @@ pub fn apply_change_set(root: &Path, change_set: &ChangeSet) -> Result<()> {
     fs::remove_dir_all(&transaction)
         .with_context(|| format!("removing promotion journal {}", transaction.display()))?;
     sync_directory(&root.join(".foundry/promotions"))?;
+    tracing::info!(
+        transaction = %transaction.display(),
+        "committed workspace promotion"
+    );
     Ok(())
 }
 
@@ -168,7 +178,8 @@ fn prepare_transaction(
             after_digest: change.after.as_ref().map(|value| value.digest.clone()),
             after_executable: change.after.as_ref().is_some_and(|value| value.executable),
         });
-        debug_assert_eq!(safe_target(root, &change.relative).unwrap(), change.target);
+        let verified_target = safe_target(root, &change.relative)?;
+        debug_assert_eq!(verified_target, change.target);
     }
     let journal = PromotionJournal {
         state: JournalState::Prepared,
@@ -180,6 +191,7 @@ fn prepare_transaction(
 }
 
 fn commit_transaction(root: &Path, transaction: &Path, journal: &PromotionJournal) -> Result<()> {
+    verify_staged_side(transaction, journal, "after")?;
     for (index, entry) in journal.entries.iter().enumerate() {
         let target = safe_target(root, &entry.path)?;
         if entry.after_exists {
@@ -210,6 +222,7 @@ fn commit_transaction(root: &Path, transaction: &Path, journal: &PromotionJourna
 }
 
 fn rollback_transaction(root: &Path, transaction: &Path, journal: &PromotionJournal) -> Result<()> {
+    verify_staged_side(transaction, journal, "before")?;
     for (index, entry) in journal.entries.iter().enumerate() {
         let target = safe_target(root, &entry.path)?;
         if entry.before_exists {
@@ -240,6 +253,46 @@ fn rollback_transaction(root: &Path, transaction: &Path, journal: &PromotionJour
     }
     fs::remove_dir_all(transaction)
         .with_context(|| format!("removing recovered journal {}", transaction.display()))?;
+    Ok(())
+}
+
+fn verify_staged_side(transaction: &Path, journal: &PromotionJournal, side: &str) -> Result<()> {
+    for (index, entry) in journal.entries.iter().enumerate() {
+        let (exists, digest, executable) = match side {
+            "before" => (
+                entry.before_exists,
+                entry.before_digest.as_deref(),
+                entry.before_executable,
+            ),
+            "after" => (
+                entry.after_exists,
+                entry.after_digest.as_deref(),
+                entry.after_executable,
+            ),
+            _ => bail!("unknown promotion journal side {side}"),
+        };
+        if !exists {
+            if digest.is_some() {
+                bail!(
+                    "promotion journal {} side for {} has a digest but no file",
+                    side,
+                    entry.path
+                );
+            }
+            continue;
+        }
+        let expected =
+            digest.with_context(|| format!("promotion journal {side} side has no digest"))?;
+        let source = transaction.join(side).join(index.to_string());
+        let actual = read_evidence(&source)?
+            .with_context(|| format!("promotion journal is missing {}", source.display()))?;
+        if actual.digest != expected || actual.executable != executable {
+            bail!(
+                "promotion journal {side} side for {} failed content verification",
+                entry.path
+            );
+        }
+    }
     Ok(())
 }
 
@@ -416,6 +469,7 @@ fn write_evidence(path: &Path, evidence: &FileEvidence) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lease;
     use foundry_core::{ChangeSet, ChangedFile};
 
     fn evidence(value: &str) -> FileEvidence {
@@ -436,6 +490,10 @@ mod tests {
         }
     }
 
+    fn mutation(root: &Path) -> lease::RepositoryMutation {
+        lease::acquire_repository(root, "promotion-test", "test promotion").unwrap()
+    }
+
     #[test]
     fn promotion_is_conflict_checked_and_idempotent() {
         let root = std::env::temp_dir().join(format!("foundry-promotion-{}", uuid::Uuid::new_v4()));
@@ -448,12 +506,13 @@ mod tests {
             after: Some(evidence("after")),
         });
 
-        apply_change_set(&root, &changes).unwrap();
-        apply_change_set(&root, &changes).unwrap();
+        let mutation = mutation(&root);
+        apply_change_set(&mutation, &changes).unwrap();
+        apply_change_set(&mutation, &changes).unwrap();
         assert_eq!(fs::read_to_string(root.join("file.txt")).unwrap(), "after");
 
         fs::write(root.join("file.txt"), "human edit").unwrap();
-        assert!(apply_change_set(&root, &changes).is_err());
+        assert!(apply_change_set(&mutation, &changes).is_err());
         assert_eq!(
             fs::read_to_string(root.join("file.txt")).unwrap(),
             "human edit"
@@ -474,7 +533,8 @@ mod tests {
             after: Some(after),
         });
 
-        assert!(apply_change_set(&root, &changes).is_err());
+        let mutation = mutation(&root);
+        assert!(apply_change_set(&mutation, &changes).is_err());
         assert!(!root.join("file.txt").exists());
         fs::remove_dir_all(root).unwrap();
     }
@@ -508,6 +568,38 @@ mod tests {
 
         assert_eq!(fs::read_to_string(root.join("file.txt")).unwrap(), "before");
         assert!(!root.join(".foundry/promotions/interrupted").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn corrupt_rollback_source_is_rejected_before_authoritative_bytes_change() {
+        let root = std::env::temp_dir().join(format!("foundry-promotion-{}", uuid::Uuid::new_v4()));
+        let transaction = root.join(".foundry/promotions/interrupted");
+        fs::create_dir_all(transaction.join("before")).unwrap();
+        fs::create_dir_all(transaction.join("after")).unwrap();
+        fs::write(root.join("file.txt"), "after-partial-commit").unwrap();
+        fs::write(transaction.join("before/0"), "tampered rollback bytes").unwrap();
+        let journal = PromotionJournal {
+            state: JournalState::Committing,
+            entries: vec![JournalEntry {
+                path: "file.txt".into(),
+                before_exists: true,
+                before_digest: Some(sha256_digest(b"before")),
+                before_executable: false,
+                after_exists: true,
+                after_digest: Some(sha256_digest(b"after-partial-commit")),
+                after_executable: false,
+            }],
+        };
+        persist_journal(&transaction, &journal).unwrap();
+
+        assert!(recover_incomplete_promotions(&root).is_err());
+
+        assert_eq!(
+            fs::read_to_string(root.join("file.txt")).unwrap(),
+            "after-partial-commit"
+        );
+        assert!(transaction.exists(), "failed recovery remains inspectable");
         fs::remove_dir_all(root).unwrap();
     }
 }

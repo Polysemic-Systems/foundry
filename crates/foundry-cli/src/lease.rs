@@ -1,4 +1,4 @@
-//! Repository-scoped iteration lease.
+//! Repository-scoped mutation lease.
 //!
 //! Two concurrent `iterate` processes can select the same task, race the
 //! plan file, and stage conflicting evidence. The lease makes the failure
@@ -18,7 +18,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const LEASE_FILE: &str = "repository.lease";
@@ -42,7 +42,7 @@ impl std::fmt::Display for LeaseInfo {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{} (pid {}) running `{}` for {}s",
+            "{} (pid {}), operation `{}`, acquired {}s ago",
             self.owner,
             self.pid,
             self.operation,
@@ -65,12 +65,12 @@ impl std::fmt::Display for LeaseRefused {
         match self {
             LeaseRefused::Held(Some(info)) => write!(
                 f,
-                "another iteration holds the repository lease: {info}\n\
+                "another operation holds the repository lease; most recent Foundry metadata: {info}\n\
                  Wait for it to finish, or inspect it with `foundry lease`."
             ),
             LeaseRefused::Held(None) => write!(
                 f,
-                "another iteration holds the repository lease (no metadata recorded).\n\
+                "another operation holds the repository lease (no metadata recorded).\n\
                  Wait for it to finish, or inspect it with `foundry lease`."
             ),
             LeaseRefused::Io(error) => write!(f, "acquiring repository lease: {error:#}"),
@@ -88,6 +88,77 @@ pub struct LeaseGuard {
     _file: File,
 }
 
+/// Compile-time witness that the repository lease is held for one canonical
+/// workspace root. Mutation APIs take this capability instead of a bare path,
+/// so callers cannot forget the lease or accidentally use a guard from a
+/// different checkout.
+#[derive(Debug)]
+pub struct RepositoryMutation {
+    root: PathBuf,
+    _guard: LeaseGuard,
+}
+
+impl RepositoryMutation {
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    pub fn require_path(&self, path: &Path) -> Result<PathBuf> {
+        let path = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            self.root.join(path)
+        };
+        let mut confined = PathBuf::new();
+        for component in path.components() {
+            match component {
+                Component::CurDir => {}
+                Component::ParentDir => {
+                    confined.pop();
+                }
+                _ => confined.push(component.as_os_str()),
+            }
+        }
+        if !confined.starts_with(&self.root) {
+            anyhow::bail!(
+                "mutation path {} is outside leased repository {}",
+                confined.display(),
+                self.root.display()
+            );
+        }
+
+        let relative = confined.strip_prefix(&self.root).with_context(|| {
+            format!(
+                "deriving repository-relative mutation path {} beneath {}",
+                confined.display(),
+                self.root.display()
+            )
+        })?;
+        let mut ancestor = self.root.clone();
+        for component in relative.components() {
+            ancestor.push(component.as_os_str());
+            match fs::symlink_metadata(&ancestor) {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    anyhow::bail!(
+                        "mutation path {} traverses symlink {}",
+                        confined.display(),
+                        ancestor.display()
+                    );
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("inspecting repository path {}", ancestor.display())
+                    });
+                }
+            }
+        }
+
+        Ok(confined)
+    }
+}
+
 /// The lease's current state, as reported by `foundry lease`.
 #[derive(Debug)]
 pub enum LeaseStatus {
@@ -96,7 +167,7 @@ pub enum LeaseStatus {
     Held(Option<LeaseInfo>),
 }
 
-/// Acquire the repository iteration lease, refusing if it is already held.
+/// Acquire the repository mutation lease, refusing if it is already held.
 pub fn acquire(
     foundry_dir: &Path,
     owner: &str,
@@ -114,6 +185,13 @@ pub fn acquire(
         .open(&path)
         .with_context(|| format!("opening lease file {path:?}"))
         .map_err(LeaseRefused::Io)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("restricting lease file {path:?}"))
+            .map_err(LeaseRefused::Io)?;
+    }
 
     match file.try_lock() {
         Ok(()) => {}
@@ -138,6 +216,90 @@ pub fn acquire(
         .map_err(LeaseRefused::Io)?;
 
     Ok(LeaseGuard { _file: file })
+}
+
+/// Acquire a repository-scoped mutation capability rooted at the canonical
+/// workspace path.
+pub fn acquire_repository(
+    root: &Path,
+    owner: &str,
+    operation: &str,
+) -> Result<RepositoryMutation, LeaseRefused> {
+    let root = root
+        .canonicalize()
+        .with_context(|| format!("resolving repository root {}", root.display()))
+        .map_err(LeaseRefused::Io)?;
+    harden_repository_state(&root).map_err(LeaseRefused::Io)?;
+    let guard = acquire(&root.join(".foundry"), owner, operation)?;
+    tracing::info!(
+        repository = %root.display(),
+        owner,
+        operation,
+        "acquired repository mutation lease"
+    );
+    Ok(RepositoryMutation {
+        root,
+        _guard: guard,
+    })
+}
+
+/// Create or migrate Foundry's local state boundary to private permissions.
+///
+/// Only the state containers and known evidence/database files are changed;
+/// attempt workspace contents retain their original executable bits.
+pub fn harden_repository_state(root: &Path) -> Result<()> {
+    let foundry = root.join(".foundry");
+    fs::create_dir_all(&foundry)
+        .with_context(|| format!("creating private state directory {}", foundry.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let private_dir = fs::Permissions::from_mode(0o700);
+        fs::set_permissions(&foundry, private_dir.clone())
+            .with_context(|| format!("restricting {}", foundry.display()))?;
+        for relative in [
+            "attempts",
+            "blobs",
+            "blobs/sha256",
+            "promotions",
+            "snapshots",
+            "tdd-baselines",
+        ] {
+            let path = foundry.join(relative);
+            if path.is_dir() {
+                fs::set_permissions(&path, private_dir.clone())
+                    .with_context(|| format!("restricting {}", path.display()))?;
+            }
+        }
+
+        let private_file = fs::Permissions::from_mode(0o600);
+        for relative in ["db.sqlite", "repository.lease"] {
+            let path = foundry.join(relative);
+            if path.is_file() {
+                fs::set_permissions(&path, private_file.clone())
+                    .with_context(|| format!("restricting {}", path.display()))?;
+            }
+        }
+        for relative in ["snapshots", "tdd-baselines"] {
+            let directory = foundry.join(relative);
+            let entries = match fs::read_dir(&directory) {
+                Ok(entries) => entries,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(error).with_context(|| format!("reading {}", directory.display()));
+                }
+            };
+            for entry in entries {
+                let path = entry?.path();
+                if path.is_file() {
+                    fs::set_permissions(&path, private_file.clone())
+                        .with_context(|| format!("restricting {}", path.display()))?;
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Report whether the lease is currently held, without taking it for longer
@@ -203,6 +365,22 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("foundry-lease-test-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn require_path_has_no_production_expect() {
+        let source = include_str!("lease.rs");
+        let (_, after_signature) = source
+            .split_once("    pub fn require_path(&self, path: &Path) -> Result<PathBuf> {")
+            .expect("RepositoryMutation::require_path must remain present");
+        let (require_path_body, _) = after_signature
+            .split_once("\n    }\n}\n\n/// The lease's current state")
+            .expect("RepositoryMutation::require_path must remain in its production impl");
+
+        assert!(
+            !require_path_body.contains(".expect") && !require_path_body.contains("panic!"),
+            "RepositoryMutation::require_path must propagate errors with context, not panic"
+        );
     }
 
     #[test]
@@ -290,5 +468,170 @@ mod tests {
         let guard = acquire(&dir, "alice", "iterate").unwrap();
         drop(guard);
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn repository_mutation_is_bound_to_one_canonical_root() {
+        let root = scratch_dir();
+        let other = scratch_dir();
+        let file = root.join("plan.md");
+        fs::write(&file, "# Plan").unwrap();
+        let other_file = other.join("plan.md");
+        fs::write(&other_file, "# Other").unwrap();
+        let mutation = acquire_repository(&root, "alice", "test mutation").unwrap();
+
+        assert_eq!(mutation.require_path(&file).unwrap(), file);
+        assert!(mutation.require_path(&other_file).is_err());
+
+        drop(mutation);
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(other).unwrap();
+    }
+
+    #[test]
+    fn propose_new_plan_accepts_a_missing_destination_beneath_the_repository() {
+        let root = scratch_dir();
+        let plan = root.join("plans/new.plan.md");
+        let mutation = acquire_repository(&root, "alice", "propose approval").unwrap();
+
+        assert_eq!(mutation.require_path(&plan).unwrap(), plan);
+
+        drop(mutation);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn propose_new_plan_resolves_a_relative_missing_destination_beneath_the_repository() {
+        let root = scratch_dir();
+        let relative_plan = Path::new("plans/new-relative.plan.md");
+        let mutation = acquire_repository(&root, "alice", "propose approval").unwrap();
+
+        assert_eq!(
+            mutation.require_path(relative_plan).unwrap(),
+            root.join(relative_plan),
+            "relative --plan paths must be resolved against the leased root, not the process CWD"
+        );
+
+        drop(mutation);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn propose_new_plan_rejects_a_missing_destination_that_lexically_escapes_the_repository() {
+        let root = scratch_dir();
+        let plan = root.join("plans/../../outside/new.plan.md");
+        let mutation = acquire_repository(&root, "alice", "propose approval").unwrap();
+
+        assert!(mutation.require_path(&plan).is_err());
+
+        drop(mutation);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn propose_new_plan_rejects_a_missing_destination_beneath_a_resolved_symlinked_ancestor() {
+        let root = scratch_dir();
+        let outside = scratch_dir();
+        std::os::unix::fs::symlink(&outside, root.join("plans")).unwrap();
+        let plan = root.join("plans/new.plan.md");
+        let mutation = acquire_repository(&root, "alice", "propose approval").unwrap();
+
+        assert!(mutation.require_path(&plan).is_err());
+
+        drop(mutation);
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn propose_new_plan_rejects_a_resolved_symlinked_ancestor_even_when_it_stays_beneath_root() {
+        let root = scratch_dir();
+        let real_plans = root.join("real-plans");
+        fs::create_dir(&real_plans).unwrap();
+        std::os::unix::fs::symlink(&real_plans, root.join("plans")).unwrap();
+        let plan = root.join("plans/new.plan.md");
+        let mutation = acquire_repository(&root, "alice", "propose approval").unwrap();
+
+        assert!(mutation.require_path(&plan).is_err());
+
+        drop(mutation);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn propose_new_plan_rejects_a_missing_destination_beneath_a_dangling_symlinked_ancestor() {
+        let root = scratch_dir();
+        std::os::unix::fs::symlink(root.join("missing-target"), root.join("plans")).unwrap();
+        let plan = root.join("plans/new.plan.md");
+        let mutation = acquire_repository(&root, "alice", "propose approval").unwrap();
+
+        assert!(mutation.require_path(&plan).is_err());
+
+        drop(mutation);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn propose_new_plan_rejects_a_dangling_symlink_destination() {
+        let root = scratch_dir();
+        let plans = root.join("plans");
+        fs::create_dir(&plans).unwrap();
+        let plan = plans.join("new.plan.md");
+        std::os::unix::fs::symlink(root.join("missing-target.plan.md"), &plan).unwrap();
+        let mutation = acquire_repository(&root, "alice", "propose approval").unwrap();
+
+        assert!(mutation.require_path(&plan).is_err());
+
+        drop(mutation);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repository_acquisition_migrates_sensitive_state_to_private_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = scratch_dir();
+        let foundry = root.join(".foundry");
+        let snapshots = foundry.join("snapshots");
+        let baselines = foundry.join("tdd-baselines");
+        fs::create_dir_all(&snapshots).unwrap();
+        fs::create_dir_all(&baselines).unwrap();
+        fs::write(foundry.join("db.sqlite"), "database").unwrap();
+        fs::write(snapshots.join("old.sqlite"), "snapshot").unwrap();
+        fs::write(baselines.join("old.json"), "workspace bytes").unwrap();
+        fs::set_permissions(&foundry, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mutation = acquire_repository(&root, "alice", "permission migration").unwrap();
+
+        let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&foundry), 0o700);
+        assert_eq!(mode(&snapshots), 0o700);
+        assert_eq!(mode(&baselines), 0o700);
+        assert_eq!(mode(&foundry.join("db.sqlite")), 0o600);
+        assert_eq!(mode(&snapshots.join("old.sqlite")), 0o600);
+        assert_eq!(mode(&baselines.join("old.json")), 0o600);
+        assert_eq!(mode(&foundry.join(LEASE_FILE)), 0o600);
+
+        drop(mutation);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn lease_metadata_describes_acquisition_age_not_run_duration() {
+        let info = LeaseInfo {
+            owner: "alice".into(),
+            pid: 42,
+            operation: "iterate".into(),
+            acquired_at_epoch_secs: now_epoch_secs(),
+        };
+        let rendered = info.to_string();
+        assert!(rendered.contains("acquired"));
+        assert!(!rendered.contains("running"));
+        assert!(!rendered.contains(" for "));
     }
 }

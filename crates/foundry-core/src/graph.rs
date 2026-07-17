@@ -17,7 +17,10 @@ use crate::{
     DiscourseAct, DiscourseSpeaker, DiscourseTurn, ReviewDraft, ReviewPerspective, ReviewResolution,
 };
 
-pub const LATEST_SCHEMA_VERSION: i64 = 7;
+pub const LATEST_SCHEMA_VERSION: i64 = 9;
+
+mod job_store;
+mod review_store;
 
 /// One raw `job_results` row, deserialized but never hydrated: hydration
 /// fails closed on missing blobs, and enumeration must survive corrupt rows.
@@ -52,6 +55,19 @@ pub enum MigrationChecksumStatus {
 pub struct MigrationChecksumReport {
     pub version: i64,
     pub status: MigrationChecksumStatus,
+}
+
+/// Joinability of append-only event history against the current node graph.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EventReferenceIntegrity {
+    pub events_scanned: usize,
+    pub events_with_missing_references: usize,
+    pub missing_node_references: usize,
+    /// Task events that remain narratable through a stable task key even
+    /// though one of their historical node UUIDs is no longer present.
+    pub narratable_by_task_key: usize,
+    /// Events with missing node UUIDs and no durable identity fallback.
+    pub unresolvable_events: usize,
 }
 
 /// Collect `sha256:<64 hex>` tokens from raw text into `digests`.
@@ -250,8 +266,8 @@ pub enum GraphError {
     InvalidTransition(#[from] TransitionError),
     #[error("job result does not match persisted job state")]
     ResultStateMismatch,
-    #[error("invalid stored job result: {0}")]
-    InvalidStoredResult(#[from] serde_json::Error),
+    #[error("JSON encoding or stored JSON is invalid: {0}")]
+    Json(#[from] serde_json::Error),
     #[error(transparent)]
     NonconformingEvidence(#[from] ConformanceError),
     #[error(transparent)]
@@ -274,6 +290,32 @@ pub enum GraphError {
     UnknownEdgeKind { kind: String },
     #[error("could not checkpoint the WAL: another connection is holding it open")]
     WalCheckpointBlocked,
+    #[error("invalid database snapshot: {0}")]
+    InvalidSnapshot(String),
+    #[error("invalid embedding: {0}")]
+    InvalidEmbedding(String),
+    #[error("filesystem error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error(
+        "idempotency key {key:?} belongs to task {existing_task:?}, not requested task {requested_task:?}"
+    )]
+    IdempotencyKeyConflict {
+        key: String,
+        existing_task: String,
+        requested_task: String,
+    },
+    #[error(
+        "task {task_key:?} and job {job_id:?} already have a pending human review resolution; resume it before recording another decision"
+    )]
+    PendingReviewResolution { task_key: String, job_id: JobId },
+    #[error("job {job_id:?} already has different immutable result evidence")]
+    JobResultConflict { job_id: JobId },
+    #[error("task {task_key:?} is {current:?}, expected {expected:?}")]
+    TaskStateMismatch {
+        task_key: String,
+        current: TaskState,
+        expected: TaskState,
+    },
 }
 
 #[derive(Debug)]
@@ -324,6 +366,11 @@ pub struct Graph {
 impl Graph {
     pub fn open(path: &Path) -> Result<Self, GraphError> {
         let conn = Connection::open(path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        }
         let mut graph = Self { conn };
         graph.migrate()?;
         Ok(graph)
@@ -337,6 +384,7 @@ impl Graph {
     }
 
     fn migrate(&mut self) -> Result<(), GraphError> {
+        self.conn.busy_timeout(std::time::Duration::from_secs(5))?;
         // SQLite disables foreign-key enforcement for each new connection.
         self.conn.pragma_update(None, "foreign_keys", "ON")?;
 
@@ -363,13 +411,13 @@ impl Graph {
         let expected_checksums: std::collections::HashMap<i64, String> = migrations
             .iter()
             .map(|(version, _)| {
-                (
+                Ok((
                     *version,
                     crate::migration_registry::checksum_for(*version)
-                        .expect("migration has an expected checksum"),
-                )
+                        .ok_or(GraphError::UnknownMigration { version: *version })?,
+                ))
             })
-            .collect();
+            .collect::<Result<_, GraphError>>()?;
 
         // Validate and backfill every row already in schema_migrations before
         // applying any new migrations. Unknown versions or mismatched checksums
@@ -401,7 +449,7 @@ impl Graph {
                 self.conn.execute_batch(sql)?;
                 let checksum = expected_checksums
                     .get(&version)
-                    .expect("migration has an expected checksum")
+                    .ok_or(GraphError::UnknownMigration { version })?
                     .clone();
                 self.conn.execute(
                     "INSERT INTO schema_migrations (version, checksum, applied_at)
@@ -412,6 +460,28 @@ impl Graph {
         }
 
         Ok(())
+    }
+
+    fn in_immediate_transaction<T>(
+        &mut self,
+        operation: impl FnOnce(&mut Self) -> Result<T, GraphError>,
+    ) -> Result<T, GraphError> {
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        match operation(self) {
+            Ok(value) => {
+                if let Err(error) = self.conn.execute_batch("COMMIT") {
+                    let _ = self.conn.execute_batch("ROLLBACK");
+                    tracing::error!(error = %error, "sqlite transaction commit failed");
+                    return Err(GraphError::Sqlite(error));
+                }
+                Ok(value)
+            }
+            Err(error) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                tracing::warn!(error = %error, "sqlite transaction rolled back");
+                Err(error)
+            }
+        }
     }
 
     /// Persist an event to the graph's event log.
@@ -435,15 +505,43 @@ impl Graph {
     }
 
     /// Drop indexed/derived state. Events, migrations, durable lifecycle state,
-    /// and rule approvals remain.
+    /// rule approvals, and plan/task identity tombstones remain.
     /// After this, the caller should re-index the codebase.
     pub fn truncate_derived(&mut self) -> Result<(), GraphError> {
         self.conn.execute("DELETE FROM code_search", [])?;
         self.conn.execute("DELETE FROM code_index", [])?;
         self.conn.execute("DELETE FROM code_embeddings", [])?;
         self.conn.execute("DELETE FROM edges", [])?;
-        self.conn
-            .execute("DELETE FROM nodes WHERE kind != 'rule'", [])?;
+        let historical_nodes = {
+            let mut statement = self
+                .conn
+                .prepare("SELECT id, payload FROM nodes WHERE kind IN ('plan', 'task')")?;
+            statement
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        for (id, raw_payload) in historical_nodes {
+            let mut payload: Value = serde_json::from_str(&raw_payload)?;
+            if let Some(object) = payload.as_object_mut() {
+                object.insert("removed".to_string(), Value::Bool(true));
+            } else {
+                payload = serde_json::json!({ "removed": true });
+            }
+            let id = NodeId(Uuid::parse_str(&id).map_err(|error| {
+                GraphError::Sqlite(rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                ))
+            })?);
+            self.update_node_payload(id, payload)?;
+        }
+        self.conn.execute(
+            "DELETE FROM nodes WHERE kind NOT IN ('rule', 'plan', 'task')",
+            [],
+        )?;
         Ok(())
     }
 
@@ -457,6 +555,63 @@ impl Graph {
             .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))?;
         if busy != 0 {
             return Err(GraphError::WalCheckpointBlocked);
+        }
+        Ok(())
+    }
+
+    /// Restore a prevalidated SQLite snapshot through SQLite's online backup
+    /// API. Validation happens against an in-memory copy before the
+    /// destination connection is touched, so a corrupt or incompatible file
+    /// cannot partially replace the live graph. The backup API performs the
+    /// replacement as a SQLite transaction and cooperates with WAL mode.
+    pub fn restore_from_snapshot(&mut self, snapshot: &Path) -> Result<(), GraphError> {
+        let source =
+            Connection::open_with_flags(snapshot, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        Self::require_integrity(&source, snapshot)?;
+        let foundry_schema: bool = source.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM sqlite_master
+                WHERE type = 'table' AND name = 'schema_migrations'
+            )",
+            [],
+            |row| row.get(0),
+        )?;
+        if !foundry_schema {
+            return Err(GraphError::InvalidSnapshot(format!(
+                "{} is SQLite but not a Foundry graph",
+                snapshot.display()
+            )));
+        }
+
+        // Prove that the snapshot is a Foundry graph this binary can migrate
+        // and open, without modifying the snapshot itself.
+        let mut validation = Connection::open_in_memory()?;
+        {
+            let backup = rusqlite::backup::Backup::new(&source, &mut validation)?;
+            backup.run_to_completion(128, std::time::Duration::from_millis(5), None)?;
+        }
+        let mut validation_graph = Self { conn: validation };
+        validation_graph.migrate()?;
+        Self::require_integrity(&validation_graph.conn, snapshot)?;
+        validation_graph.verify_migration_checksums()?;
+        drop(validation_graph);
+
+        {
+            let backup = rusqlite::backup::Backup::new(&source, &mut self.conn)?;
+            backup.run_to_completion(128, std::time::Duration::from_millis(5), None)?;
+        }
+        self.migrate()?;
+        Self::require_integrity(&self.conn, snapshot)
+    }
+
+    fn require_integrity(connection: &Connection, source: &Path) -> Result<(), GraphError> {
+        let result: String =
+            connection.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+        if result != "ok" {
+            return Err(GraphError::InvalidSnapshot(format!(
+                "{} failed integrity_check: {result}",
+                source.display()
+            )));
         }
         Ok(())
     }
@@ -528,8 +683,53 @@ impl Graph {
         .collect()
     }
 
+    /// Audit every event's node UUIDs against the current graph, while
+    /// separately counting task events that retain a durable key.
+    pub fn event_reference_integrity(&self) -> Result<EventReferenceIntegrity, GraphError> {
+        let mut node_statement = self.conn.prepare("SELECT id FROM nodes")?;
+        let node_ids = node_statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<std::collections::HashSet<_>, _>>()?;
+
+        let mut event_statement = self.conn.prepare("SELECT payload FROM events")?;
+        let payloads = event_statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let mut report = EventReferenceIntegrity {
+            events_scanned: payloads.len(),
+            ..Default::default()
+        };
+        for payload in payloads {
+            let event: Event =
+                serde_json::from_str(&payload).map_err(|error| GraphError::CorruptStoredEvent {
+                    detail: format!("undecodable payload: {error}"),
+                })?;
+            let missing = event
+                .node_references()
+                .into_iter()
+                .filter(|id| !node_ids.contains(&id.0.to_string()))
+                .count();
+            if missing == 0 {
+                continue;
+            }
+            report.events_with_missing_references += 1;
+            report.missing_node_references += missing;
+            if event.durable_task_key().is_some() {
+                report.narratable_by_task_key += 1;
+            } else {
+                report.unresolvable_events += 1;
+            }
+        }
+        Ok(report)
+    }
+
     /// Append an immutable, reply-linked turn to a Socratic discourse.
     pub fn record_discourse_turn(&mut self, turn: &DiscourseTurn) -> Result<(), GraphError> {
+        self.in_immediate_transaction(|graph| graph.record_discourse_turn_inner(turn))
+    }
+
+    fn record_discourse_turn_inner(&mut self, turn: &DiscourseTurn) -> Result<(), GraphError> {
         if turn.context_key.trim().is_empty() || turn.body.trim().is_empty() {
             return Err(GraphError::InvalidDiscourse(
                 "context and body must be non-empty".into(),
@@ -618,6 +818,16 @@ impl Graph {
         context_key: &str,
         question: &str,
     ) -> Result<Uuid, GraphError> {
+        self.in_immediate_transaction(|graph| {
+            graph.ensure_discourse_question_inner(context_key, question)
+        })
+    }
+
+    fn ensure_discourse_question_inner(
+        &mut self,
+        context_key: &str,
+        question: &str,
+    ) -> Result<Uuid, GraphError> {
         let existing: Option<String> = self
             .conn
             .query_row(
@@ -641,7 +851,7 @@ impl Graph {
             None,
         );
         let id = turn.id;
-        self.record_discourse_turn(&turn)?;
+        self.record_discourse_turn_inner(&turn)?;
         Ok(id)
     }
 
@@ -725,634 +935,8 @@ impl Graph {
         Ok(())
     }
 
-    /// Initialize a durable task lifecycle. Repeating the operation is idempotent.
-    pub fn initialize_task_state(
-        &mut self,
-        task_key: &str,
-        state: TaskState,
-    ) -> Result<TaskState, GraphError> {
-        self.conn.execute(
-            "INSERT OR IGNORE INTO task_states (task_key, state, updated_at)
-             VALUES (?1, ?2, ?3)",
-            params![task_key, state.as_str(), Utc::now().to_rfc3339()],
-        )?;
-        self.task_state(task_key)?
-            .ok_or_else(|| GraphError::Sqlite(rusqlite::Error::QueryReturnedNoRows))
-    }
-
-    pub fn task_state(&self, task_key: &str) -> Result<Option<TaskState>, GraphError> {
-        self.conn
-            .query_row(
-                "SELECT state FROM task_states WHERE task_key = ?1",
-                params![task_key],
-                |row| parse_task_state(row.get::<_, String>(0)?),
-            )
-            .optional()
-            .map_err(GraphError::Sqlite)
-    }
-
-    pub fn transition_task(
-        &mut self,
-        task_key: &str,
-        next: TaskState,
-    ) -> Result<TaskState, GraphError> {
-        let current = self
-            .task_state(task_key)?
-            .ok_or_else(|| GraphError::Sqlite(rusqlite::Error::QueryReturnedNoRows))?;
-        self.transition_task_from(task_key, current, next)
-    }
-
-    /// The write half of a task transition, conditional on the state the
-    /// caller validated against. Optimistic concurrency: the update lands
-    /// only if the row still holds that state, so a concurrent operator who
-    /// got there first surfaces as a lost race, never a double claim.
-    fn transition_task_from(
-        &mut self,
-        task_key: &str,
-        current: TaskState,
-        next: TaskState,
-    ) -> Result<TaskState, GraphError> {
-        let next = current.transition(next)?;
-        let updated = self.conn.execute(
-            "UPDATE task_states SET state = ?1, updated_at = ?2
-             WHERE task_key = ?3 AND state = ?4",
-            params![
-                next.as_str(),
-                Utc::now().to_rfc3339(),
-                task_key,
-                current.as_str()
-            ],
-        )?;
-        if updated == 0 {
-            return Err(GraphError::StaleTransition {
-                key: task_key.to_string(),
-                expected: current.as_str().to_string(),
-            });
-        }
-        Ok(next)
-    }
-
-    /// Create one execution attempt, returning the original job on a repeated key.
-    pub fn create_job(&mut self, task_key: &str, idempotency_key: &str) -> Result<Job, GraphError> {
-        let id = JobId::new();
-        let now = Utc::now().to_rfc3339();
-        self.conn.execute(
-            "INSERT OR IGNORE INTO jobs
-             (id, task_key, idempotency_key, state, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
-            params![
-                id.0.to_string(),
-                task_key,
-                idempotency_key,
-                JobState::Queued.as_str(),
-                now
-            ],
-        )?;
-        self.job_by_idempotency_key(idempotency_key)?
-            .ok_or_else(|| GraphError::Sqlite(rusqlite::Error::QueryReturnedNoRows))
-    }
-
-    pub fn job_by_idempotency_key(&self, key: &str) -> Result<Option<Job>, GraphError> {
-        self.conn
-            .query_row(
-                "SELECT id, task_key, idempotency_key, state
-                 FROM jobs WHERE idempotency_key = ?1",
-                params![key],
-                map_job,
-            )
-            .optional()
-            .map_err(GraphError::Sqlite)
-    }
-
-    pub fn transition_job(&mut self, id: JobId, next: JobState) -> Result<JobState, GraphError> {
-        let current: String = self.conn.query_row(
-            "SELECT state FROM jobs WHERE id = ?1",
-            params![id.0.to_string()],
-            |row| row.get(0),
-        )?;
-        let current = parse_job_state_value(&current)?;
-        self.transition_job_from(id, current, next)
-    }
-
-    /// Same optimistic guard as `transition_task_from`: no lost update can
-    /// silently overwrite a concurrent operator's claim.
-    fn transition_job_from(
-        &mut self,
-        id: JobId,
-        current: JobState,
-        next: JobState,
-    ) -> Result<JobState, GraphError> {
-        let next = current.transition(next)?;
-        let updated = self.conn.execute(
-            "UPDATE jobs SET state = ?1, updated_at = ?2 WHERE id = ?3 AND state = ?4",
-            params![
-                next.as_str(),
-                Utc::now().to_rfc3339(),
-                id.0.to_string(),
-                current.as_str()
-            ],
-        )?;
-        if updated == 0 {
-            return Err(GraphError::StaleTransition {
-                key: id.0.to_string(),
-                expected: current.as_str().to_string(),
-            });
-        }
-        Ok(next)
-    }
-
-    /// Store immutable, governed evidence for a terminal job. Repeating the
-    /// same write is idempotent; the original evidence is never overwritten.
-    pub fn record_job_result(&mut self, result: &JobResult) -> Result<(), GraphError> {
-        result.governance.validate()?;
-        let persisted: String = self.conn.query_row(
-            "SELECT state FROM jobs WHERE id = ?1",
-            params![result.job_id.0.to_string()],
-            |row| row.get(0),
-        )?;
-        if parse_job_state_value(&persisted)? != result.state || !result.state.is_terminal() {
-            return Err(GraphError::ResultStateMismatch);
-        }
-        let stored = crate::evidence_store::externalize_job_result(&self.conn, result)?;
-        self.conn.execute(
-            "INSERT OR IGNORE INTO job_results (job_id, result, created_at) VALUES (?1, ?2, ?3)",
-            params![
-                result.job_id.0.to_string(),
-                serde_json::to_string(&stored)?,
-                Utc::now().to_rfc3339()
-            ],
-        )?;
-        Ok(())
-    }
-
-    pub fn job_result(&self, id: JobId) -> Result<Option<JobResult>, GraphError> {
-        let json: Option<String> = self
-            .conn
-            .query_row(
-                "SELECT result FROM job_results WHERE job_id = ?1",
-                params![id.0.to_string()],
-                |row| row.get(0),
-            )
-            .optional()?;
-        json.map(|value| {
-            let result = serde_json::from_str(&value)?;
-            crate::evidence_store::hydrate_job_result(&self.conn, result).map_err(GraphError::from)
-        })
-        .transpose()
-    }
-
-    /// Evidence is linked through its immutable job to the stable task key.
-    pub fn job_results_for_task(&self, task_key: &str) -> Result<Vec<JobResult>, GraphError> {
-        let mut stmt = self.conn.prepare(
-            "SELECT r.result FROM job_results r JOIN jobs j ON j.id = r.job_id
-             WHERE j.task_key = ?1 ORDER BY r.created_at",
-        )?;
-        let rows = stmt.query_map(params![task_key], |row| row.get::<_, String>(0))?;
-        rows.map(|row| {
-            let json = row?;
-            let result = serde_json::from_str(&json)?;
-            crate::evidence_store::hydrate_job_result(&self.conn, result).map_err(GraphError::from)
-        })
-        .collect()
-    }
-
-    /// Enumerate every stored job result without hydrating evidence blobs.
-    /// A malformed row is surfaced as `parsed: Err(..)` so a retention sweep
-    /// can quarantine it instead of crashing on corrupt history.
-    pub fn job_result_rows(&self) -> Result<Vec<JobResultRow>, GraphError> {
-        let mut stmt = self.conn.prepare(
-            "SELECT r.job_id, j.task_key, r.created_at, r.result
-             FROM job_results r LEFT JOIN jobs j ON j.id = r.job_id
-             ORDER BY r.created_at",
-        )?;
-        let rows = stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, Option<String>>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-            ))
-        })?;
-        rows.map(|row| {
-            let (job_id, task_key, created_at, json) = row?;
-            let parsed =
-                serde_json::from_str::<JobResult>(&json).map_err(|error| error.to_string());
-            Ok(JobResultRow {
-                job_id,
-                task_key,
-                created_at,
-                raw: json,
-                parsed,
-            })
-        })
-        .collect()
-    }
-
-    pub fn job_result_exists(&self, id: JobId) -> Result<bool, GraphError> {
-        let found: Option<i64> = self
-            .conn
-            .query_row(
-                "SELECT 1 FROM job_results WHERE job_id = ?1",
-                params![id.0.to_string()],
-                |row| row.get(0),
-            )
-            .optional()?;
-        Ok(found.is_some())
-    }
-
-    /// Delete one job's evidence payload. The `jobs`, `reviews`, and `events`
-    /// rows are append-only history and are never touched; only the governed
-    /// evidence is erased. Returns whether a row existed.
-    pub fn delete_job_result(&mut self, id: JobId) -> Result<bool, GraphError> {
-        let deleted = self.conn.execute(
-            "DELETE FROM job_results WHERE job_id = ?1",
-            params![id.0.to_string()],
-        )?;
-        Ok(deleted > 0)
-    }
-
-    /// Every blob digest referenced by any remaining job result. Valid rows
-    /// contribute their structural references; malformed rows are scanned for
-    /// `sha256:<64 hex>` tokens so corrupt history can never cause its blobs
-    /// to be treated as unreferenced (conservative-safe for garbage collection).
-    pub fn referenced_blob_digests(&self) -> Result<BTreeSet<String>, GraphError> {
-        let mut digests = BTreeSet::new();
-        for row in self.job_result_rows()? {
-            match &row.parsed {
-                Ok(result) => {
-                    if let Some(change_set) = &result.change_set {
-                        for change in &change_set.files {
-                            for evidence in [change.before.as_ref(), change.after.as_ref()]
-                                .into_iter()
-                                .flatten()
-                            {
-                                if let Some(blob) = &evidence.blob {
-                                    digests.insert(blob.clone());
-                                }
-                                digests.insert(evidence.digest.clone());
-                            }
-                        }
-                    }
-                }
-                Err(_) => scan_sha256_tokens(&row.raw, &mut digests),
-            }
-        }
-        Ok(digests)
-    }
-
-    /// Location of the content-addressed evidence store for file-backed
-    /// graphs; `None` for in-memory graphs, which keep evidence inline.
-    pub fn blob_store_root(&self) -> Result<Option<std::path::PathBuf>, GraphError> {
-        Ok(crate::evidence_store::store_root(&self.conn)?)
-    }
-
-    pub fn record_review(&mut self, review: &Review) -> Result<TaskState, GraphError> {
-        if self.task_state(&review.task_key)? != Some(TaskState::Review) {
-            return Err(GraphError::ResultStateMismatch);
-        }
-        let job_task: String = self.conn.query_row(
-            "SELECT task_key FROM jobs WHERE id = ?1 AND state = 'succeeded'",
-            params![review.job_id.0.to_string()],
-            |row| row.get(0),
-        )?;
-        if job_task != review.task_key || self.job_result(review.job_id)?.is_none() {
-            return Err(GraphError::ResultStateMismatch);
-        }
-        self.conn.execute(
-            "INSERT INTO reviews (id, task_key, job_id, decision, reviewer, reason, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                Uuid::new_v4().to_string(),
-                review.task_key,
-                review.job_id.0.to_string(),
-                match review.decision {
-                    ReviewDecision::Approve => "approve",
-                    ReviewDecision::Reject => "reject",
-                },
-                review.reviewer,
-                review.reason,
-                Utc::now().to_rfc3339(),
-            ],
-        )?;
-        self.transition_task(
-            &review.task_key,
-            match review.decision {
-                ReviewDecision::Approve => TaskState::Done,
-                ReviewDecision::Reject => TaskState::Ready,
-            },
-        )
-    }
-
-    pub fn reviews_for_task(&self, task_key: &str) -> Result<Vec<Review>, GraphError> {
-        let mut stmt = self.conn.prepare(
-            "SELECT task_key, job_id, decision, reviewer, reason FROM reviews
-             WHERE task_key = ?1 ORDER BY created_at",
-        )?;
-        let rows = stmt.query_map(params![task_key], |row| {
-            let id: String = row.get(1)?;
-            let id = Uuid::parse_str(&id).map_err(|error| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    1,
-                    rusqlite::types::Type::Text,
-                    Box::new(error),
-                )
-            })?;
-            let decision: String = row.get(2)?;
-            Ok(Review {
-                task_key: row.get(0)?,
-                job_id: JobId(id),
-                decision: if decision == "approve" {
-                    ReviewDecision::Approve
-                } else {
-                    ReviewDecision::Reject
-                },
-                reviewer: row.get(3)?,
-                reason: row.get(4)?,
-            })
-        })?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(GraphError::Sqlite)
-    }
-
-    /// Persist immutable advisory review text. Drafts cannot transition task state.
-    pub fn record_review_draft(&mut self, draft: &ReviewDraft) -> Result<(), GraphError> {
-        let inserted = self.conn.execute(
-            "INSERT OR IGNORE INTO review_drafts
-             (id, task_key, job_id, perspective, recommendation, body, agent, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![
-                draft.id.to_string(),
-                draft.task_key,
-                draft.job_id.0.to_string(),
-                draft.perspective.as_str(),
-                match draft.recommendation {
-                    ReviewDecision::Approve => "approve",
-                    ReviewDecision::Reject => "reject",
-                },
-                draft.body,
-                draft.agent,
-                draft.created_at.to_rfc3339(),
-            ],
-        )?;
-        if inserted == 1 {
-            let context_key = format!("review:{}", draft.job_id.0);
-            let question_id = self.ensure_discourse_question(
-                &context_key,
-                "Does the immutable evidence justify the proposed task decision, and what would falsify that conclusion?",
-            )?;
-            let turn = DiscourseTurn {
-                id: draft.id,
-                context_key,
-                speaker: DiscourseSpeaker::SocraticPartner,
-                act: match draft.perspective {
-                    ReviewPerspective::Evidence => DiscourseAct::Observation,
-                    ReviewPerspective::Adversarial => DiscourseAct::Challenge,
-                },
-                body: draft.body.clone(),
-                reply_to: Some(question_id),
-                created_at: draft.created_at,
-            };
-            self.record_discourse_turn(&turn)?;
-            self.emit_event(&Event::ReviewDrafted {
-                draft_id: draft.id,
-                job_id: draft.job_id,
-                perspective: draft.perspective.as_str().into(),
-            })?;
-        }
-        Ok(())
-    }
-
-    pub fn review_drafts_for_job(&self, job_id: JobId) -> Result<Vec<ReviewDraft>, GraphError> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, task_key, perspective, recommendation, body, agent, created_at
-             FROM review_drafts WHERE job_id = ?1 ORDER BY perspective",
-        )?;
-        let rows = stmt.query_map(params![job_id.0.to_string()], |row| {
-            let id: String = row.get(0)?;
-            let id = Uuid::parse_str(&id).map_err(|error| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    0,
-                    rusqlite::types::Type::Text,
-                    Box::new(error),
-                )
-            })?;
-            let perspective: String = row.get(2)?;
-            let recommendation: String = row.get(3)?;
-            let created_at: String = row.get(6)?;
-            let created_at = DateTime::parse_from_rfc3339(&created_at)
-                .map_err(|error| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        6,
-                        rusqlite::types::Type::Text,
-                        Box::new(error),
-                    )
-                })?
-                .with_timezone(&Utc);
-            Ok(ReviewDraft {
-                id,
-                task_key: row.get(1)?,
-                job_id,
-                perspective: if perspective == "evidence" {
-                    ReviewPerspective::Evidence
-                } else {
-                    ReviewPerspective::Adversarial
-                },
-                recommendation: if recommendation == "approve" {
-                    ReviewDecision::Approve
-                } else {
-                    ReviewDecision::Reject
-                },
-                body: row.get(4)?,
-                agent: row.get(5)?,
-                created_at,
-            })
-        })?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(GraphError::Sqlite)
-    }
-
-    /// Record the human-edited resolution. A pending review performs the
-    /// authoritative transition; an already-reviewed job records retrospective
-    /// learning without rewriting the historical decision or task state.
-    /// A review decision is actionable only when the job belongs to the
-    /// named task and that task is awaiting review. Callers must enforce
-    /// this before any side effect of the decision — promoting staged bytes
-    /// on the strength of an unvalidated task/job pair is a gate bypass.
-    pub fn validate_review_binding(&self, task_key: &str, job_id: JobId) -> Result<(), GraphError> {
-        let job_task: Option<String> = self
-            .conn
-            .query_row(
-                "SELECT task_key FROM jobs WHERE id = ?1",
-                params![job_id.0.to_string()],
-                |row| row.get(0),
-            )
-            .optional()?;
-        match job_task {
-            Some(owner) if owner == task_key => {}
-            _ => return Err(GraphError::ResultStateMismatch),
-        }
-        if self.task_state(task_key)? != Some(TaskState::Review) {
-            return Err(GraphError::ResultStateMismatch);
-        }
-        Ok(())
-    }
-
-    pub fn record_review_resolution(
-        &mut self,
-        resolution: &ReviewResolution,
-    ) -> Result<TaskState, GraphError> {
-        if let Some(draft_id) = resolution.selected_draft_id {
-            let count: i64 = self.conn.query_row(
-                "SELECT COUNT(*) FROM review_drafts
-                 WHERE id = ?1 AND task_key = ?2 AND job_id = ?3",
-                params![
-                    draft_id.to_string(),
-                    resolution.task_key,
-                    resolution.job_id.0.to_string()
-                ],
-                |row| row.get(0),
-            )?;
-            if count != 1 {
-                return Err(GraphError::ResultStateMismatch);
-            }
-        }
-
-        let task_state = self
-            .task_state(&resolution.task_key)?
-            .ok_or(GraphError::ResultStateMismatch)?;
-        let state = if task_state == TaskState::Review {
-            let review = Review {
-                task_key: resolution.task_key.clone(),
-                job_id: resolution.job_id,
-                decision: resolution.decision,
-                reviewer: resolution.reviewer.clone(),
-                reason: resolution.final_body.clone(),
-            };
-            self.record_review(&review)?
-        } else {
-            let recorded = self
-                .reviews_for_task(&resolution.task_key)?
-                .into_iter()
-                .find(|review| review.job_id == resolution.job_id)
-                .ok_or(GraphError::ResultStateMismatch)?;
-            if recorded.decision != resolution.decision {
-                return Err(GraphError::ResultStateMismatch);
-            }
-            task_state
-        };
-        self.conn.execute(
-            "INSERT INTO review_resolutions
-             (id, task_key, job_id, selected_draft_id, original_draft, final_body,
-              edit_similarity, decision, reviewer, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-            params![
-                resolution.id.to_string(),
-                resolution.task_key,
-                resolution.job_id.0.to_string(),
-                resolution.selected_draft_id.map(|id| id.to_string()),
-                resolution.original_draft,
-                resolution.final_body,
-                resolution.edit_similarity,
-                match resolution.decision {
-                    ReviewDecision::Approve => "approve",
-                    ReviewDecision::Reject => "reject",
-                },
-                resolution.reviewer,
-                resolution.created_at.to_rfc3339(),
-            ],
-        )?;
-        let context_key = format!("review:{}", resolution.job_id.0);
-        let question_id = self.ensure_discourse_question(
-            &context_key,
-            "Does the immutable evidence justify the proposed task decision, and what would falsify that conclusion?",
-        )?;
-        let reply_to = if let Some(draft_id) = resolution.selected_draft_id {
-            let exists: bool = self.conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM discourse_turns WHERE id = ?1)",
-                params![draft_id.to_string()],
-                |row| row.get(0),
-            )?;
-            if !exists {
-                let (body, perspective): (String, String) = self.conn.query_row(
-                    "SELECT body, perspective FROM review_drafts WHERE id = ?1",
-                    params![draft_id.to_string()],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )?;
-                self.record_discourse_turn(&DiscourseTurn {
-                    id: draft_id,
-                    context_key: context_key.clone(),
-                    speaker: DiscourseSpeaker::SocraticPartner,
-                    act: if perspective == "evidence" {
-                        DiscourseAct::Observation
-                    } else {
-                        DiscourseAct::Challenge
-                    },
-                    body,
-                    reply_to: Some(question_id),
-                    created_at: resolution.created_at,
-                })?;
-            }
-            draft_id
-        } else {
-            question_id
-        };
-        self.record_discourse_turn(&DiscourseTurn {
-            id: resolution.id,
-            context_key,
-            speaker: DiscourseSpeaker::Human,
-            act: DiscourseAct::Synthesis,
-            body: resolution.final_body.clone(),
-            reply_to: Some(reply_to),
-            created_at: resolution.created_at,
-        })?;
-        self.emit_event(&Event::ReviewResolved {
-            resolution_id: resolution.id,
-            job_id: resolution.job_id,
-            selected_draft_id: resolution.selected_draft_id,
-        })?;
-        Ok(state)
-    }
-
-    /// Human-authored resolutions are compact learning context for later reviews.
-    pub fn recent_review_lessons(&self, limit: usize) -> Result<Vec<String>, GraphError> {
-        let mut stmt = self.conn.prepare(
-            "SELECT decision, final_body FROM review_resolutions
-             ORDER BY created_at DESC LIMIT ?1",
-        )?;
-        let rows = stmt.query_map(params![limit as i64], |row| {
-            Ok(format!(
-                "{}: {}",
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?
-            ))
-        })?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(GraphError::Sqlite)
-    }
-
-    /// Human resolutions scoped to the task being decided. This avoids
-    /// treating unrelated historical prose as globally applicable policy.
-    pub fn review_lessons_for_task(
-        &self,
-        task_key: &str,
-        limit: usize,
-    ) -> Result<Vec<String>, GraphError> {
-        let mut stmt = self.conn.prepare(
-            "SELECT decision, final_body FROM review_resolutions
-             WHERE task_key = ?1 ORDER BY created_at DESC LIMIT ?2",
-        )?;
-        let rows = stmt.query_map(params![task_key, limit as i64], |row| {
-            Ok(format!(
-                "{}: {}",
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?
-            ))
-        })?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(GraphError::Sqlite)
-    }
-
     pub fn create_node(&mut self, node: &Node) -> Result<NodeId, GraphError> {
+        let payload = serde_json::to_string(&node.payload)?;
         self.conn.execute(
             "INSERT INTO nodes (id, kind, name, payload, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -1360,7 +944,7 @@ impl Graph {
                 node.id.0.to_string(),
                 node.kind.as_str(),
                 node.name,
-                serde_json::to_string(&node.payload).unwrap(),
+                payload,
                 node.created_at.to_rfc3339()
             ],
         )?;
@@ -1370,13 +954,10 @@ impl Graph {
 
     /// Update an existing node's payload by ID.
     pub fn update_node_payload(&mut self, id: NodeId, payload: Value) -> Result<(), GraphError> {
+        let payload = serde_json::to_string(&payload)?;
         self.conn.execute(
             "UPDATE nodes SET payload = ?1, created_at = ?2 WHERE id = ?3",
-            params![
-                serde_json::to_string(&payload).unwrap(),
-                Utc::now().to_rfc3339(),
-                id.0.to_string()
-            ],
+            params![payload, Utc::now().to_rfc3339(), id.0.to_string()],
         )?;
         Ok(())
     }
@@ -1400,13 +981,10 @@ impl Graph {
                     Box::new(e),
                 ))
             })?);
+            let payload = serde_json::to_string(&node.payload)?;
             self.conn.execute(
                 "UPDATE nodes SET payload = ?1, created_at = ?2 WHERE id = ?3",
-                params![
-                    serde_json::to_string(&node.payload).unwrap(),
-                    Utc::now().to_rfc3339(),
-                    id.0.to_string()
-                ],
+                params![payload, Utc::now().to_rfc3339(), id.0.to_string()],
             )?;
             Ok(id)
         } else {
@@ -1434,13 +1012,10 @@ impl Graph {
                 ))
             })?);
             let payload = serde_json::json!({ "approved": true });
+            let payload = serde_json::to_string(&payload)?;
             self.conn.execute(
                 "UPDATE nodes SET payload = ?1, created_at = ?2 WHERE id = ?3",
-                params![
-                    serde_json::to_string(&payload).unwrap(),
-                    Utc::now().to_rfc3339(),
-                    id.0.to_string()
-                ],
+                params![payload, Utc::now().to_rfc3339(), id.0.to_string()],
             )?;
             self.emit_event(&Event::ReviewRequested {
                 review_id: id,
@@ -1670,6 +1245,9 @@ impl Graph {
         content: &str,
         embedding: Option<&[f32]>,
     ) -> Result<NodeId, GraphError> {
+        if let Some(embedding) = embedding {
+            Self::require_finite_embedding(embedding, "model output")?;
+        }
         let tx = self.conn.transaction()?;
 
         let existing_id: Option<String> = tx
@@ -1692,13 +1270,10 @@ impl Graph {
                 "path": relative_path,
                 "lines": content.lines().count(),
             });
+            let payload = serde_json::to_string(&payload)?;
             tx.execute(
                 "UPDATE nodes SET payload = ?1, created_at = ?2 WHERE id = ?3",
-                params![
-                    serde_json::to_string(&payload).unwrap(),
-                    Utc::now().to_rfc3339(),
-                    id.0.to_string()
-                ],
+                params![payload, Utc::now().to_rfc3339(), id.0.to_string()],
             )?;
 
             // Remove stale search rows tied to this file.
@@ -1722,6 +1297,7 @@ impl Graph {
             });
             let node = Node::new(NodeKind::Code, relative_path, payload);
             let id = node.id;
+            let payload = serde_json::to_string(&node.payload)?;
             tx.execute(
                 "INSERT INTO nodes (id, kind, name, payload, created_at)
                  VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -1729,7 +1305,7 @@ impl Graph {
                     id.0.to_string(),
                     node.kind.as_str(),
                     node.name,
-                    serde_json::to_string(&node.payload).unwrap(),
+                    payload,
                     node.created_at.to_rfc3339()
                 ],
             )?;
@@ -1747,10 +1323,15 @@ impl Graph {
         )?;
 
         if let Some(emb) = embedding {
-            let emb_json = serde_json::to_string(emb).unwrap();
+            let emb_json = serde_json::to_string(emb)?;
             tx.execute(
                 "INSERT OR REPLACE INTO code_embeddings (node_id, embedding) VALUES (?1, ?2)",
                 params![id.0.to_string(), emb_json],
+            )?;
+        } else {
+            tx.execute(
+                "DELETE FROM code_embeddings WHERE node_id = ?1",
+                params![id.0.to_string()],
             )?;
         }
 
@@ -1796,6 +1377,7 @@ impl Graph {
         query_embedding: &[f32],
         limit: usize,
     ) -> Result<Vec<(Node, f32)>, GraphError> {
+        Self::require_finite_embedding(query_embedding, "query")?;
         let mut stmt = self
             .conn
             .prepare("SELECT n.id, n.kind, n.name, n.payload, n.created_at, e.embedding FROM code_embeddings e JOIN nodes n ON e.node_id = n.id")?;
@@ -1812,15 +1394,34 @@ impl Graph {
             Ok((node, emb))
         })?;
 
-        let mut scored: Vec<(Node, f32)> = rows
-            .filter_map(|r| r.ok())
-            .filter_map(|(node, emb)| {
-                crate::embed::cosine_similarity(query_embedding, &emb).map(|score| (node, score))
-            })
-            .collect();
+        let vectors = rows.collect::<Result<Vec<_>, _>>()?;
+        let mut scored = Vec::new();
+        for (node, embedding) in vectors {
+            Self::require_finite_embedding(
+                &embedding,
+                &format!("stored vector for {}", node.name),
+            )?;
+            if let Some(score) = crate::embed::cosine_similarity(query_embedding, &embedding) {
+                scored.push((node, score));
+            }
+        }
         scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         scored.truncate(limit);
         Ok(scored)
+    }
+
+    fn require_finite_embedding(embedding: &[f32], context: &str) -> Result<(), GraphError> {
+        if embedding.is_empty() {
+            return Err(GraphError::InvalidEmbedding(format!(
+                "{context} is an empty vector"
+            )));
+        }
+        if let Some(index) = embedding.iter().position(|value| !value.is_finite()) {
+            return Err(GraphError::InvalidEmbedding(format!(
+                "{context} contains a non-finite value at index {index}"
+            )));
+        }
+        Ok(())
     }
 
     /// Index a markdown plan into the graph.
@@ -1837,17 +1438,33 @@ impl Graph {
             "path": relative_path,
             "title": plan.title,
             "task_count": plan.tasks.len(),
+            "removed": false,
         });
         let plan_node = Node::new(NodeKind::Plan, relative_path, plan_payload);
         let plan_id = self.upsert_node_by_name(&plan_node)?;
 
-        // Remove stale task nodes and edges belonging to this plan.
+        // Stable task keys are durable graph identities. Keep current task
+        // nodes and update them in place; tasks removed from the plan become
+        // disconnected tombstones. Rebuilding or deleting every task UUID
+        // made append-only lifecycle events unjoinable after reindex.
         let prefix = format!("{}#%", relative_path);
-        let stale_ids: Vec<String> = self
+        let current_names: std::collections::HashSet<String> = plan
+            .tasks
+            .iter()
+            .map(|task| format!("{}#{}", relative_path, task.id))
+            .collect();
+        let existing_tasks: Vec<(String, String, String)> = self
             .conn
-            .prepare("SELECT id FROM nodes WHERE kind = 'task' AND name LIKE ?1")?
-            .query_map(params![&prefix], |row| row.get(0))?
+            .prepare("SELECT id, name, payload FROM nodes WHERE kind = 'task' AND name LIKE ?1")?
+            .query_map(params![&prefix], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?
             .collect::<Result<Vec<_>, _>>()?;
+        let stale_ids: Vec<String> = existing_tasks
+            .iter()
+            .filter(|(_, name, _)| !current_names.contains(name))
+            .map(|(id, _, _)| id.clone())
+            .collect();
         if !stale_ids.is_empty() {
             let placeholders = stale_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
             let edge_sql = format!(
@@ -1858,8 +1475,41 @@ impl Graph {
                 &edge_sql,
                 params_from_iter(stale_ids.iter().chain(stale_ids.iter())),
             )?;
-            let node_sql = format!("DELETE FROM nodes WHERE id IN ({})", placeholders);
-            self.conn.execute(&node_sql, params_from_iter(&stale_ids))?;
+            for (id, name, raw_payload) in &existing_tasks {
+                if current_names.contains(name) {
+                    continue;
+                }
+                let mut payload: Value = serde_json::from_str(raw_payload)?;
+                if let Some(object) = payload.as_object_mut() {
+                    object.insert("removed".to_string(), Value::Bool(true));
+                } else {
+                    payload = serde_json::json!({ "removed": true });
+                }
+                let id = NodeId(Uuid::parse_str(id).map_err(|error| {
+                    GraphError::Sqlite(rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    ))
+                })?);
+                self.update_node_payload(id, payload)?;
+            }
+        }
+
+        // Contains and inferred/file dependency edges are derived from the
+        // current plan contents. Refresh those edges without replacing the
+        // task nodes they connect.
+        self.conn.execute(
+            "DELETE FROM edges WHERE from_node = ?1 AND kind = 'contains'",
+            params![plan_id.0.to_string()],
+        )?;
+        for (id, name, _) in &existing_tasks {
+            if current_names.contains(name) {
+                self.conn.execute(
+                    "DELETE FROM edges WHERE from_node = ?1 AND kind = 'depends_on'",
+                    params![id],
+                )?;
+            }
         }
 
         for task in &plan.tasks {
@@ -1869,12 +1519,18 @@ impl Graph {
                 "done": task.done,
                 "run": task.run,
                 "stop": task.stop,
+                "removed": false,
             });
             let task_node = Node::new(NodeKind::Task, &task_name, task_payload);
             let task_id = self.upsert_node_by_name(&task_node)?;
 
             self.create_edge(plan_id, task_id, EdgeKind::Contains)?;
-            self.record_event(&Event::TaskPlanned { task_id, plan_id })?;
+            self.record_event(&Event::TaskPlanned {
+                task_id,
+                plan_id,
+                task_key: task_name.clone(),
+                plan_path: relative_path.to_string(),
+            })?;
 
             // Explicit file links are the strongest expression of intent.
             for file in &task.files {
@@ -1949,6 +1605,37 @@ mod tests {
         }
     }
 
+    fn graph_with_review_job(task_key: &str, idempotency_key: &str) -> (Graph, Job) {
+        let mut graph = Graph::open_in_memory().unwrap();
+        graph
+            .initialize_task_state(task_key, TaskState::Ready)
+            .unwrap();
+        graph.transition_task(task_key, TaskState::Running).unwrap();
+        let job = graph.create_job(task_key, idempotency_key).unwrap();
+        graph.transition_job(job.id, JobState::Running).unwrap();
+        graph.transition_job(job.id, JobState::Succeeded).unwrap();
+        graph
+            .record_job_result(
+                &JobResult::new(job.id, JobState::Succeeded, evidence_governance()).unwrap(),
+            )
+            .unwrap();
+        graph.transition_task(task_key, TaskState::Review).unwrap();
+        (graph, job)
+    }
+
+    fn create_events_table_for_claimed_v1_schema(connection: &Connection) {
+        connection
+            .execute_batch(
+                "CREATE TABLE events (
+                    id TEXT PRIMARY KEY,
+                    kind TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );",
+            )
+            .unwrap();
+    }
+
     #[test]
     fn graph_can_create_and_retrieve_node() {
         let mut graph = Graph::open_in_memory().unwrap();
@@ -1990,6 +1677,39 @@ mod tests {
     }
 
     #[test]
+    fn schema_indexes_event_history_and_uses_task_state_primary_key() {
+        let graph = Graph::open_in_memory().unwrap();
+        let event_plan: String = graph
+            .conn
+            .query_row(
+                "EXPLAIN QUERY PLAN
+                 SELECT payload, created_at FROM events
+                 ORDER BY created_at DESC LIMIT 20",
+                [],
+                |row| row.get(3),
+            )
+            .unwrap();
+        assert!(
+            event_plan.contains("idx_events_created_at"),
+            "event history must avoid a full scan and temporary sort: {event_plan}"
+        );
+
+        let task_plan: String = graph
+            .conn
+            .query_row(
+                "EXPLAIN QUERY PLAN
+                 SELECT state FROM task_states WHERE task_key = 'plans/f.plan.md#task'",
+                [],
+                |row| row.get(3),
+            )
+            .unwrap();
+        assert!(
+            task_plan.contains("sqlite_autoindex_task_states_1"),
+            "the task_key primary key must remain the lifecycle lookup index: {task_plan}"
+        );
+    }
+
+    #[test]
     fn upgrades_existing_schema_migrations_table_preserving_applied_at_and_backfilling_checksums() {
         // Capture the checksums that the current migrations are expected to produce.
         let fresh = Graph::open_in_memory().unwrap();
@@ -2013,6 +1733,7 @@ mod tests {
         // Simulate a legacy graph database whose schema_migrations table only tracked
         // the applied version and timestamp.
         let conn = Connection::open_in_memory().unwrap();
+        create_events_table_for_claimed_v1_schema(&conn);
         conn.execute(
             "CREATE TABLE schema_migrations (
                 version INTEGER PRIMARY KEY NOT NULL,
@@ -2135,6 +1856,7 @@ mod tests {
             .unwrap();
 
         let conn = Connection::open_in_memory().unwrap();
+        create_events_table_for_claimed_v1_schema(&conn);
         conn.execute(
             "CREATE TABLE schema_migrations (
                 version INTEGER PRIMARY KEY NOT NULL,
@@ -2279,6 +2001,7 @@ mod tests {
             .unwrap();
 
         let conn = Connection::open_in_memory().unwrap();
+        create_events_table_for_claimed_v1_schema(&conn);
         conn.execute(
             "CREATE TABLE schema_migrations (
                 version INTEGER PRIMARY KEY NOT NULL,
@@ -2400,6 +2123,7 @@ mod tests {
         use crate::migration_storage::MigrationStorage;
 
         let conn = Connection::open_in_memory().unwrap();
+        create_events_table_for_claimed_v1_schema(&conn);
         conn.execute(
             "CREATE TABLE schema_migrations (
                 version INTEGER PRIMARY KEY NOT NULL,
@@ -2458,6 +2182,7 @@ mod tests {
         // Simulate a legacy graph database whose schema_migrations table only tracked
         // the applied version and timestamp.
         let conn = Connection::open_in_memory().unwrap();
+        create_events_table_for_claimed_v1_schema(&conn);
         conn.execute(
             "CREATE TABLE schema_migrations (
                 version INTEGER PRIMARY KEY NOT NULL,
@@ -2502,6 +2227,58 @@ mod tests {
     }
 
     #[test]
+    fn non_finite_and_corrupt_embeddings_fail_closed() {
+        let mut graph = Graph::open_in_memory().unwrap();
+        assert!(
+            graph
+                .index_code_with_embedding("src/bad.rs", "fn bad() {}", Some(&[f32::NAN]))
+                .is_err(),
+            "non-finite model output must be rejected before JSON turns it into null"
+        );
+        assert!(
+            graph
+                .find_node_by_name(NodeKind::Code, "src/bad.rs")
+                .unwrap()
+                .is_none(),
+            "embedding validation must happen before graph mutation"
+        );
+
+        let id = graph
+            .index_code_with_embedding("src/good.rs", "fn good() {}", Some(&[1.0, 0.0]))
+            .unwrap();
+        graph
+            .conn
+            .execute(
+                "UPDATE code_embeddings SET embedding = '[null]' WHERE node_id = ?1",
+                params![id.0.to_string()],
+            )
+            .unwrap();
+        assert!(
+            graph.semantic_search(&[1.0, 0.0], 5).is_err(),
+            "malformed stored vectors must surface instead of disappearing from results"
+        );
+        assert!(graph.semantic_search(&[f32::INFINITY], 5).is_err());
+    }
+
+    #[test]
+    fn reindexing_changed_code_without_a_vector_invalidates_the_old_embedding() {
+        let mut graph = Graph::open_in_memory().unwrap();
+        graph
+            .index_code_with_embedding("src/changing.rs", "fn old() {}", Some(&[1.0, 0.0]))
+            .unwrap();
+        assert_eq!(graph.semantic_search(&[1.0, 0.0], 5).unwrap().len(), 1);
+
+        graph
+            .index_code("src/changing.rs", "fn replacement() {}")
+            .unwrap();
+
+        assert!(
+            graph.semantic_search(&[1.0, 0.0], 5).unwrap().is_empty(),
+            "semantic search must never score a vector produced for old content"
+        );
+    }
+
+    #[test]
     fn graph_index_is_idempotent() {
         let mut graph = Graph::open_in_memory().unwrap();
         let id1 = graph.index_code("src/lib.rs", "first").unwrap();
@@ -2510,6 +2287,140 @@ mod tests {
         let results = graph.search_code("Graph").unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0.name, "src/lib.rs");
+    }
+
+    #[test]
+    fn reindexing_a_plan_preserves_durable_task_node_identity() {
+        let mut graph = Graph::open_in_memory().unwrap();
+        let plan = crate::plan::Plan::parse(
+            "features",
+            "# Features\n\n1. [ ] Keep identity - id: keep-identity\n",
+        );
+        let task_key = "plans/features.plan.md#keep-identity";
+
+        graph.index_plan("plans/features.plan.md", &plan).unwrap();
+        let first = graph
+            .find_node_by_name(NodeKind::Task, task_key)
+            .unwrap()
+            .unwrap()
+            .id;
+
+        graph.index_plan("plans/features.plan.md", &plan).unwrap();
+        let second = graph
+            .find_node_by_name(NodeKind::Task, task_key)
+            .unwrap()
+            .unwrap()
+            .id;
+
+        assert_eq!(
+            first, second,
+            "a stable task key must keep the same graph identity across reindex"
+        );
+        let task_events = graph
+            .events(100)
+            .unwrap()
+            .into_iter()
+            .filter_map(|(_, event)| match event {
+                Event::TaskPlanned { task_key, .. } => Some(task_key),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(task_events, vec![task_key, task_key]);
+        let integrity = graph.event_reference_integrity().unwrap();
+        assert!(integrity.events_scanned > 0);
+        assert_eq!(
+            integrity.events_with_missing_references, 0,
+            "ordinary reindex must not orphan append-only event references"
+        );
+        assert_eq!(integrity.missing_node_references, 0);
+        assert_eq!(integrity.unresolvable_events, 0);
+    }
+
+    #[test]
+    fn removing_a_planned_task_tombstones_its_node_for_event_history() {
+        let mut graph = Graph::open_in_memory().unwrap();
+        let original = crate::plan::Plan::parse(
+            "features",
+            "# Features\n\n1. [ ] Keep - id: keep\n2. [ ] Remove - id: remove\n",
+        );
+        graph
+            .index_plan("plans/features.plan.md", &original)
+            .unwrap();
+        let removed_key = "plans/features.plan.md#remove";
+        let removed_id = graph
+            .find_node_by_name(NodeKind::Task, removed_key)
+            .unwrap()
+            .unwrap()
+            .id;
+
+        let edited = crate::plan::Plan::parse("features", "# Features\n\n1. [ ] Keep - id: keep\n");
+        graph.index_plan("plans/features.plan.md", &edited).unwrap();
+
+        let tombstone = graph
+            .find_node_by_name(NodeKind::Task, removed_key)
+            .unwrap()
+            .expect("removed task keeps a historical join target");
+        assert_eq!(tombstone.id, removed_id);
+        assert_eq!(tombstone.payload["removed"], true);
+        assert_eq!(
+            graph
+                .event_reference_integrity()
+                .unwrap()
+                .missing_node_references,
+            0
+        );
+    }
+
+    #[test]
+    fn rebuild_preserves_plan_and_task_identities_as_tombstones() {
+        let mut graph = Graph::open_in_memory().unwrap();
+        let plan = crate::plan::Plan::parse("features", "# F\n\n1. [ ] Stable - id: stable\n");
+        graph.index_plan("plans/f.plan.md", &plan).unwrap();
+        let plan_id = graph
+            .find_node_by_name(NodeKind::Plan, "plans/f.plan.md")
+            .unwrap()
+            .unwrap()
+            .id;
+        let task_id = graph
+            .find_node_by_name(NodeKind::Task, "plans/f.plan.md#stable")
+            .unwrap()
+            .unwrap()
+            .id;
+
+        graph.truncate_derived().unwrap();
+        assert_eq!(
+            graph.get_node(plan_id).unwrap().unwrap().payload["removed"],
+            true
+        );
+        assert_eq!(
+            graph.get_node(task_id).unwrap().unwrap().payload["removed"],
+            true
+        );
+
+        graph.index_plan("plans/f.plan.md", &plan).unwrap();
+        assert_eq!(
+            graph
+                .find_node_by_name(NodeKind::Plan, "plans/f.plan.md")
+                .unwrap()
+                .unwrap()
+                .id,
+            plan_id
+        );
+        assert_eq!(
+            graph
+                .find_node_by_name(NodeKind::Task, "plans/f.plan.md#stable")
+                .unwrap()
+                .unwrap()
+                .id,
+            task_id
+        );
+        assert_eq!(
+            graph
+                .event_reference_integrity()
+                .unwrap()
+                .missing_node_references,
+            0
+        );
     }
 
     #[test]
@@ -2569,13 +2480,85 @@ mod tests {
     }
 
     #[test]
-    fn job_persistence_keeps_original_task_for_reused_key() {
+    fn job_claim_and_finish_commit_lifecycle_as_one_idempotent_protocol() {
+        let mut graph = Graph::open_in_memory().unwrap();
+        let (job, claimed) = graph.claim_job("task-claim", "claim-1").unwrap();
+        assert!(claimed);
+        assert_eq!(job.state, JobState::Running);
+        assert_eq!(
+            graph.task_state("task-claim").unwrap(),
+            Some(TaskState::Running)
+        );
+        let result = JobResult::new(job.id, JobState::Succeeded, evidence_governance()).unwrap();
+
+        assert_eq!(
+            graph.finish_job("task-claim", &result).unwrap(),
+            TaskState::Review
+        );
+        let (replayed, claimed) = graph.claim_job("task-claim", "claim-1").unwrap();
+        assert!(!claimed);
+        assert_eq!(replayed.id, job.id);
+        assert_eq!(replayed.state, JobState::Succeeded);
+        assert_eq!(graph.job_result(job.id).unwrap(), Some(result));
+    }
+
+    #[test]
+    fn failed_terminal_task_transition_rolls_back_job_and_result_together() {
+        let mut graph = Graph::open_in_memory().unwrap();
+        let (job, claimed) = graph
+            .claim_job("task-finish-atomic", "finish-atomic-1")
+            .unwrap();
+        assert!(claimed);
+        graph
+            .conn
+            .execute_batch(
+                "CREATE TRIGGER fail_review_transition
+                 BEFORE UPDATE ON task_states
+                 WHEN NEW.state = 'review'
+                 BEGIN
+                     SELECT RAISE(ABORT, 'forced task transition failure');
+                 END;",
+            )
+            .unwrap();
+        let result = JobResult::new(job.id, JobState::Succeeded, evidence_governance()).unwrap();
+
+        assert!(graph.finish_job("task-finish-atomic", &result).is_err());
+        assert_eq!(
+            graph.task_state("task-finish-atomic").unwrap(),
+            Some(TaskState::Running)
+        );
+        assert_eq!(
+            graph
+                .job_by_idempotency_key("finish-atomic-1")
+                .unwrap()
+                .unwrap()
+                .state,
+            JobState::Running
+        );
+        assert!(graph.job_result(job.id).unwrap().is_none());
+    }
+
+    #[test]
+    fn job_persistence_rejects_a_reused_key_from_another_task() {
         let mut graph = Graph::open_in_memory().unwrap();
         let original = graph.create_job("task-a", "same-operation").unwrap();
-        let repeated = graph.create_job("task-b", "same-operation").unwrap();
+        let repeated = graph.create_job("task-b", "same-operation");
 
-        assert_eq!(original.id, repeated.id);
-        assert_eq!(repeated.task_key, "task-a");
+        assert!(matches!(
+            repeated,
+            Err(GraphError::IdempotencyKeyConflict {
+                existing_task,
+                requested_task,
+                ..
+            }) if existing_task == "task-a" && requested_task == "task-b"
+        ));
+        assert_eq!(
+            graph
+                .job_by_idempotency_key("same-operation")
+                .unwrap()
+                .unwrap(),
+            original
+        );
     }
 
     #[test]
@@ -2590,7 +2573,10 @@ mod tests {
         graph.record_job_result(&result).unwrap();
 
         result.stdout = "replacement".into();
-        graph.record_job_result(&result).unwrap();
+        assert!(matches!(
+            graph.record_job_result(&result),
+            Err(GraphError::JobResultConflict { job_id }) if job_id == job.id
+        ));
         assert_eq!(graph.job_result(job.id).unwrap().unwrap().stdout, "first");
         assert_eq!(graph.job_results_for_task("task-a").unwrap().len(), 1);
         assert!(graph.job_results_for_task("task-b").unwrap().is_empty());
@@ -3083,6 +3069,118 @@ mod tests {
     }
 
     #[test]
+    fn staged_review_blocks_an_opposite_decision_and_same_decision_resumes() {
+        let (mut graph, job) = graph_with_review_job("task-pending", "pending-review-1");
+        let approval = ReviewResolution {
+            id: Uuid::new_v4(),
+            task_key: "task-pending".into(),
+            job_id: job.id,
+            selected_draft_id: None,
+            original_draft: None,
+            final_body: "The immutable evidence supports promotion".into(),
+            edit_similarity: None,
+            decision: ReviewDecision::Approve,
+            reviewer: "human@example.test".into(),
+            created_at: Utc::now(),
+        };
+
+        let staged = graph.stage_review_resolution(&approval).unwrap();
+        assert_eq!(
+            graph.task_state("task-pending").unwrap(),
+            Some(TaskState::Review)
+        );
+        let same_decision_retry = ReviewResolution {
+            id: Uuid::new_v4(),
+            ..approval.clone()
+        };
+        assert_eq!(
+            graph
+                .stage_review_resolution(&same_decision_retry)
+                .unwrap()
+                .id,
+            staged.id,
+            "a retry resumes the durable resolution instead of replacing it"
+        );
+        let opposite = ReviewResolution {
+            id: Uuid::new_v4(),
+            decision: ReviewDecision::Reject,
+            ..approval
+        };
+        assert!(matches!(
+            graph.stage_review_resolution(&opposite),
+            Err(GraphError::PendingReviewResolution { .. })
+        ));
+
+        assert_eq!(
+            graph.finalize_staged_review_resolution(staged.id).unwrap(),
+            TaskState::Done
+        );
+        assert_eq!(graph.reviews_for_task("task-pending").unwrap().len(), 1);
+        let pending: i64 = graph
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM pending_review_resolutions",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pending, 0);
+    }
+
+    #[test]
+    fn failed_resolution_finalization_rolls_back_and_keeps_pending_recovery() {
+        let (mut graph, job) = graph_with_review_job("task-atomic", "atomic-review-1");
+        let resolution = ReviewResolution {
+            id: Uuid::new_v4(),
+            task_key: "task-atomic".into(),
+            job_id: job.id,
+            selected_draft_id: None,
+            original_draft: None,
+            final_body: "Approval should commit as one invariant".into(),
+            edit_similarity: None,
+            decision: ReviewDecision::Approve,
+            reviewer: "human@example.test".into(),
+            created_at: Utc::now(),
+        };
+        let staged = graph.stage_review_resolution(&resolution).unwrap();
+        graph
+            .conn
+            .execute_batch(
+                "CREATE TRIGGER fail_review_resolution
+                 BEFORE INSERT ON review_resolutions
+                 BEGIN
+                     SELECT RAISE(ABORT, 'forced resolution failure');
+                 END;",
+            )
+            .unwrap();
+
+        assert!(graph.finalize_staged_review_resolution(staged.id).is_err());
+        assert_eq!(
+            graph.task_state("task-atomic").unwrap(),
+            Some(TaskState::Review)
+        );
+        assert!(graph.reviews_for_task("task-atomic").unwrap().is_empty());
+        let pending: i64 = graph
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM pending_review_resolutions",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pending, 1, "the durable recovery intent must survive");
+
+        graph
+            .conn
+            .execute_batch("DROP TRIGGER fail_review_resolution")
+            .unwrap();
+        assert_eq!(
+            graph.finalize_staged_review_resolution(staged.id).unwrap(),
+            TaskState::Done
+        );
+    }
+
+    #[test]
     fn advisory_drafts_require_a_human_resolution_to_transition_state() {
         let mut graph = Graph::open_in_memory().unwrap();
         graph
@@ -3332,12 +3430,14 @@ mod tests {
         graph
             .record_event(&Event::TaskStarted {
                 task_id,
+                task_key: "plans/test.plan.md#do-work".to_string(),
                 description: "do work".to_string(),
             })
             .unwrap();
         graph
             .record_event(&Event::TaskCompleted {
                 task_id,
+                task_key: "plans/test.plan.md#do-work".to_string(),
                 description: "do work".to_string(),
             })
             .unwrap();

@@ -1,3 +1,4 @@
+use crate::manifest;
 use anyhow::{Context, Result, bail};
 use foundry_core::{ChangeSet, ChangeStatus, ChangedFile, FileEvidence, JobId, JobSpec};
 use sha2::{Digest, Sha256};
@@ -31,7 +32,7 @@ pub struct StreamCapture {
     pub dropped_bytes: usize,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct RunnerOutput {
     pub exit_code: Option<i32>,
     pub stdout: String,
@@ -119,33 +120,18 @@ pub fn run_podman(
 }
 
 /// Workspace `path = "../<sibling>/…"` dependencies live outside the mounted
-/// workspace, so a cargo job inside the container cannot see them. Mount each
-/// referenced sibling read-only at the container path its relative reference
-/// resolves to (`../polysemic` from `/workspace` is `/polysemic`).
+/// workspace, so a cargo job inside the container cannot see them. For an
+/// editor-agent attempt, derive the allowlist from the authoritative workspace
+/// manifest, never the agent-writable copy.
 fn add_path_dependency_mounts(spec: &JobSpec, root: &Path, args: &mut Vec<String>) -> Result<()> {
     if spec.command.first().map(String::as_str) != Some("cargo") {
         return Ok(());
     }
-    let manifest = root.join("Cargo.toml");
-    let Ok(text) = std::fs::read_to_string(&manifest) else {
+    let manifest_root = authoritative_manifest_root(root);
+    let Some(parent) = manifest_root.parent() else {
         return Ok(());
     };
-    let Some(parent) = root.parent() else {
-        return Ok(());
-    };
-    let mut siblings: Vec<String> = Vec::new();
-    for capture in text.split("path = \"../").skip(1) {
-        let Some(reference) = capture.split('"').next() else {
-            continue;
-        };
-        let Some(name) = reference.split('/').next() else {
-            continue;
-        };
-        if name.is_empty() || name.contains("..") || siblings.iter().any(|s| s == name) {
-            continue;
-        }
-        siblings.push(name.to_string());
-    }
+    let siblings = manifest::sibling_path_dependencies(&manifest_root)?;
     if siblings.is_empty() {
         return Ok(());
     }
@@ -158,16 +144,33 @@ fn add_path_dependency_mounts(spec: &JobSpec, root: &Path, args: &mut Vec<String
         let host = parent.join(&name);
         if !host.is_dir() {
             bail!(
-                "workspace references path dependency ../{name} but {} does not exist",
+                "authoritative workspace references path dependency ../{name} but {} does not exist",
                 host.display()
             );
         }
-        // Attempts reach their siblings through symlinks; mount the target.
-        let host = host.canonicalize().unwrap_or(host);
+        let host = host.canonicalize().with_context(|| {
+            format!("resolving authoritative path dependency {}", host.display())
+        })?;
         mounts.extend(["--volume".into(), format!("{}:/{name}:ro", host.display())]);
     }
     args.splice(image_index..image_index, mounts);
     Ok(())
+}
+
+fn authoritative_manifest_root(root: &Path) -> std::path::PathBuf {
+    let Some(attempts) = root.parent() else {
+        return root.to_path_buf();
+    };
+    let Some(foundry) = attempts.parent() else {
+        return root.to_path_buf();
+    };
+    if attempts.file_name() == Some(std::ffi::OsStr::new("attempts"))
+        && foundry.file_name() == Some(std::ffi::OsStr::new(".foundry"))
+        && let Some(authoritative) = foundry.parent()
+    {
+        return authoritative.to_path_buf();
+    }
+    root.to_path_buf()
 }
 
 fn add_cargo_cache_mount(spec: &JobSpec, args: &mut Vec<String>) -> Result<()> {
@@ -236,6 +239,13 @@ pub fn snapshot_workspace(root: &Path) -> Result<WorkspaceSnapshot> {
             )
     }) {
         let entry = entry?;
+        if entry.file_type().is_symlink() {
+            let relative = entry.path().strip_prefix(root).unwrap_or(entry.path());
+            bail!(
+                "workspace evidence refuses symbolic link {}",
+                relative.display()
+            );
+        }
         if !entry.file_type().is_file() {
             continue;
         }
@@ -393,6 +403,45 @@ fn utf8_char_len(leading: u8) -> usize {
     }
 }
 
+pub fn ensure_container_toolchain(spec: &mut JobSpec, image: &str, root: &Path) -> Result<()> {
+    let rust_command = spec
+        .command
+        .first()
+        .is_some_and(|program| matches!(program.as_str(), "cargo" | "rustc" | "rustup" | "just"));
+    if !rust_command || spec.environment.contains_key("RUSTUP_TOOLCHAIN") {
+        return Ok(());
+    }
+
+    let discovery = JobSpec {
+        command: vec!["rustup".into(), "toolchain".into(), "list".into()],
+        // Avoid the repository's rust-toolchain.toml while discovering what
+        // the image already has available offline.
+        working_directory: "/tmp".into(),
+        environment: Default::default(),
+        timeout_seconds: 60,
+        cpu_limit: None,
+        memory_limit_bytes: None,
+        network_enabled: false,
+    };
+    let output = run_podman(&discovery, image, root, Arc::new(AtomicBool::new(false)))?;
+    if output.exit_code != Some(0) {
+        bail!(
+            "cannot discover container Rust toolchain: {}",
+            output.stderr.trim()
+        );
+    }
+    let toolchain = output
+        .stdout
+        .lines()
+        .find(|line| line.contains("default"))
+        .or_else(|| output.stdout.lines().next())
+        .and_then(|line| line.split_whitespace().next())
+        .context("container image has no installed rustup toolchain")?;
+    spec.environment
+        .insert("RUSTUP_TOOLCHAIN".into(), toolchain.to_owned());
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -405,7 +454,13 @@ mod tests {
         fs::create_dir_all(parent.join("sibling/crates/dep")).unwrap();
         fs::write(
             root.join("Cargo.toml"),
-            "[workspace.dependencies]\n\
+            "# path = \"../commented-out\"\n\
+             [package]\n\
+             name = \"fixture\"\n\
+             version = \"0.0.0\"\n\
+             [package.metadata.fixture]\n\
+             path = \"../metadata-only\"\n\
+             [workspace.dependencies]\n\
              dep = { path = \"../sibling/crates/dep\" }\n\
              dep2 = { package = \"x\", path = \"../sibling/crates/other\" }\n\
              local = { path = \"crates/local\" }\n",
@@ -448,7 +503,7 @@ mod tests {
         // confusing in-container failure.
         fs::write(
             root.join("Cargo.toml"),
-            "dep = { path = \"../missing/crates/dep\" }\n",
+            "[dependencies]\ndep = { path = \"../missing/crates/dep\" }\n",
         )
         .unwrap();
         let mut args: Vec<String> = vec!["run".into(), "img".into(), "cargo".into(), "test".into()];
@@ -468,6 +523,49 @@ mod tests {
         add_path_dependency_mounts(&spec, &root, &mut args).unwrap();
         assert_eq!(args, vec!["run", "img", "ls"]);
 
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn agent_attempt_cannot_expand_the_authoritative_dependency_mount_allowlist() {
+        let parent =
+            std::env::temp_dir().join(format!("foundry-attempt-mounts-{}", JobId::new().0));
+        let authoritative = parent.join("app");
+        let attempts = authoritative.join(".foundry/attempts");
+        let attempt = attempts.join("task-hash");
+        let victim = attempts.join("victim-task-hash");
+        fs::create_dir_all(&attempt).unwrap();
+        fs::create_dir_all(&victim).unwrap();
+        fs::create_dir_all(parent.join("sibling/crates/dep")).unwrap();
+        fs::write(
+            authoritative.join("Cargo.toml"),
+            "[workspace.dependencies]\ndep = { path = \"../sibling/crates/dep\" }\n",
+        )
+        .unwrap();
+        fs::write(
+            attempt.join("Cargo.toml"),
+            "[dependencies]\nstolen = { path = \"../victim-task-hash/crate\" }\n",
+        )
+        .unwrap();
+        let spec = JobSpec {
+            command: vec!["cargo".into(), "test".into()],
+            working_directory: "/workspace".into(),
+            environment: Default::default(),
+            timeout_seconds: 60,
+            cpu_limit: None,
+            memory_limit_bytes: None,
+            network_enabled: false,
+        };
+        let mut args: Vec<String> = vec!["run".into(), "img".into(), "cargo".into(), "test".into()];
+
+        add_path_dependency_mounts(&spec, &attempt, &mut args).unwrap();
+
+        let rendered = args.join(" ");
+        assert!(rendered.contains(":/sibling:ro"));
+        assert!(
+            !rendered.contains("victim-task-hash"),
+            "agent-edited manifests must not mount another attempt: {rendered}"
+        );
         fs::remove_dir_all(parent).unwrap();
     }
 
@@ -505,6 +603,24 @@ mod tests {
         assert!(changes.base_revision.starts_with("sha256:"));
         assert!(changes.patch_digest.starts_with("sha256:"));
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_snapshot_rejects_symlinks_instead_of_silently_omitting_them() {
+        let parent =
+            std::env::temp_dir().join(format!("foundry-runner-symlink-{}", JobId::new().0));
+        let root = parent.join("workspace");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(parent.join("outside.txt"), "outside").unwrap();
+        std::os::unix::fs::symlink(parent.join("outside.txt"), root.join("escape")).unwrap();
+
+        let error = snapshot_workspace(&root).unwrap_err().to_string();
+        assert!(
+            error.contains("symbolic link"),
+            "symlink refusal must be explicit evidence, not omission: {error}"
+        );
+        fs::remove_dir_all(parent).unwrap();
     }
 
     // Capture-limit tests for the runner's stdout/stderr readers.

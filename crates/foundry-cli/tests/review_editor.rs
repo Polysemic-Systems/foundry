@@ -90,8 +90,8 @@ fn setup_environment(root: &ScratchDir) -> (PathBuf, PathBuf, PathBuf) {
         &format!(
             "#!/bin/sh\n\
              file=\"$1\"\n\
-             if ! grep -q 'Shared question' \"$file\"; then\n\
-                 echo 'editor: draft did not contain expected original text' >&2\n\
+             if [ -s \"$file\" ]; then\n\
+                 echo 'editor: rationale was pre-populated from advisory prose' >&2\n\
                  exit 1\n\
              fi\n\
              cat > \"$file\" <<'EOF'\n{}EOF\n\
@@ -299,6 +299,16 @@ fn review_edit_suspends_the_tui_and_replaces_the_draft_via_editor() {
         Duration::from_secs(5),
         "TUI enter alternate screen",
     );
+
+    // Choosing a partner answers only the advisory-choice question. It must
+    // not copy that partner's prose or recommendation into the human answer.
+    writer.write_all(b"1").unwrap();
+    writer.flush().unwrap();
+
+    // Selection alone must not sign the review. If it did, the process would
+    // exit here and the editor sentinel below could never be observed.
+    writer.write_all(b"s").unwrap();
+    writer.flush().unwrap();
 
     // Open the external editor.
     writer.write_all(b"e").unwrap();

@@ -1,0 +1,10 @@
+# Harden Foundry: fail closed on unsupported cgroup limits
+
+1. [x] Add `--allow-cgroup-fallback` flag to `foundry job-run`, defaulting to false, plus an env var `FOUNDRY_ALLOW_CGROUP_FALLBACK`; default behavior fails closed when cgroup limits cannot be enforced - files: crates/foundry-cli/src/main.rs - id: add-allow-cgroup-fallback-flag-to-jobrun
+2. [x] Add `--allow-cgroup-fallback` flag to `foundry iterate`, defaulting to false, and thread it through `cmd_iterate` to the sandbox verification job - files: crates/foundry-cli/src/main.rs - id: add-allow-cgroup-fallback-flag-to-iterate
+3. [x] Add `allow_cgroup_fallback` field to `JobRunRequest` and pass it into `run_podman_compatible` - files: crates/foundry-cli/src/main.rs - id: add-allow-cgroup-fallback-field-to-jobrunrequest
+4. [x] Move cgroup-boundary policy out of `main.rs` into a focused `cgroup_policy.rs` module so the change does not grow the oversized `main.rs`; keep `runner.rs` primitives intact - files: crates/foundry-cli/src/runner.rs, crates/foundry-cli/src/cgroup_policy.rs - id: extract-runner-compat-module
+5. [x] Make `run_podman_compatible` bail with a clear error when cgroup limits are unsupported and `allow_cgroup_fallback` is false; keep the warning-and-fallback path only when explicitly allowed - files: crates/foundry-cli/src/cgroup_policy.rs - id: modify-run-podman-compatible-to-fail-closed
+6. [x] Update `debug_runner_preflight` to disallow cgroup fallback so `--debug-runner` reflects the hardened default - files: crates/foundry-cli/src/runner.rs - id: update-debug-runner-preflight-to-disallow-fallback
+7. [x] Add unit tests covering the fail-closed and allowed-fallback branches of `cgroup_limit_action` - files: crates/foundry-cli/src/cgroup_policy.rs - run: cargo test -p foundry-cli - id: add-unit-tests-for-cgroup-fail-closed
+8. [x] Run the full workspace test suite, clippy, rustfmt, and architecture-budget gate to verify no regressions - run: cargo test --workspace && cargo clippy --workspace --all-targets -- -D warnings && cargo fmt --all && ./scripts/gate-fast.sh - id: run-tests-and-clippy-to-verify

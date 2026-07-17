@@ -73,6 +73,13 @@ pub fn deterministic_evidence_review(task_key: &str, result: &JobResult) -> Revi
                     .into(),
             );
         }
+        Some(foundry_core::job::acceptance_authority::RETRY_WITHOUT_RED) => {
+            blockers.push(
+                "The successful repair/retry did not revalidate the red phase; \
+                 it cannot inherit falsifiability authority from an earlier process."
+                    .into(),
+            );
+        }
         Some(other) => {
             observations.push(format!("Unrecognized acceptance authority: {other}."));
         }
@@ -235,6 +242,18 @@ mod tests {
             draft
                 .body
                 .contains("predates acceptance-authority tracking"),
+            "{}",
+            draft.body
+        );
+    }
+
+    #[test]
+    fn repair_retry_without_a_revalidated_red_phase_is_a_blocker() {
+        let result = result_with_authority(Some("retry-without-observed-red-phase"));
+        let draft = deterministic_evidence_review("plans/f.plan.md#some-task", &result);
+        assert_eq!(draft.recommendation, ReviewDecision::Reject);
+        assert!(
+            draft.body.contains("did not revalidate the red phase"),
             "{}",
             draft.body
         );
