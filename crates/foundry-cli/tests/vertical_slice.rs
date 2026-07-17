@@ -132,7 +132,7 @@ fn iterate_waits_for_recorded_review_before_advancing_plan() {
     let plan = plans.join("safe.plan.md");
     fs::write(
         &plan,
-        "# Safe plan\n\n1. [ ] Run checks - run: cargo test\n",
+        "# Safe plan\n\n1. [ ] Run checks - run: cargo test - id: run-checks\n",
     )
     .unwrap();
     let db = root.join("foundry.sqlite");
@@ -171,7 +171,7 @@ fn iterate_waits_for_recorded_review_before_advancing_plan() {
     );
 
     let graph = Graph::open(&db).unwrap();
-    let task_key = "plans/safe.plan.md#task-2";
+    let task_key = "plans/safe.plan.md#run-checks";
     assert_eq!(graph.task_state(task_key).unwrap(), Some(TaskState::Review));
     let result = graph.job_results_for_task(task_key).unwrap().pop().unwrap();
     drop(graph);
@@ -288,7 +288,7 @@ fn tdd_job_evidence_captures_changes_made_before_sandbox_verification() {
     let plan = plans.join("capture.plan.md");
     fs::write(
         &plan,
-        "# Capture plan\n\n1. [ ] Capture editor changes - run: cargo test\n",
+        "# Capture plan\n\n1. [ ] Capture editor changes - run: cargo test - id: capture-editor-changes\n",
     )
     .unwrap();
     let db = root.join("foundry.sqlite");
@@ -324,7 +324,7 @@ fn tdd_job_evidence_captures_changes_made_before_sandbox_verification() {
 
     let graph = Graph::open(&db).unwrap();
     let result = graph
-        .job_results_for_task("plans/capture.plan.md#task-2")
+        .job_results_for_task("plans/capture.plan.md#capture-editor-changes")
         .unwrap()
         .pop()
         .expect("verification job evidence");
@@ -395,7 +395,7 @@ fn tdd_job_evidence_keeps_the_pre_agent_baseline_across_failed_verification_retr
     let plan = plans.join("retry-capture.plan.md");
     fs::write(
         &plan,
-        "# Retry capture plan\n\n1. [ ] Capture edits across retries - run: cargo test\n",
+        "# Retry capture plan\n\n1. [ ] Capture edits across retries - run: cargo test - id: capture-edits-across-retries\n",
     )
     .unwrap();
     let db = root.join("foundry.sqlite");
@@ -438,7 +438,7 @@ fn tdd_job_evidence_keeps_the_pre_agent_baseline_across_failed_verification_retr
 
     let graph = Graph::open(&db).unwrap();
     let result = graph
-        .job_results_for_task("plans/retry-capture.plan.md#task-2")
+        .job_results_for_task("plans/retry-capture.plan.md#capture-edits-across-retries")
         .unwrap()
         .into_iter()
         .find(|result| result.state == foundry_core::JobState::Succeeded)
@@ -516,7 +516,7 @@ fn staged_tdd_changes_reach_the_authoritative_workspace_only_after_approval() {
     let plan = plans.join("promotion.plan.md");
     fs::write(
         &plan,
-        "# Promotion plan\n\n1. [ ] Stage safely - run: cargo test\n",
+        "# Promotion plan\n\n1. [ ] Stage safely - run: cargo test - id: stage-safely\n",
     )
     .unwrap();
     let db = root.join("foundry.sqlite");
@@ -553,7 +553,7 @@ fn staged_tdd_changes_reach_the_authoritative_workspace_only_after_approval() {
                 "--db",
                 db.to_str().unwrap(),
                 "--task",
-                "plans/promotion.plan.md#task-2",
+                "plans/promotion.plan.md#stage-safely",
                 "--job",
                 &job.to_string(),
                 "--reviewer",
@@ -573,7 +573,7 @@ fn staged_tdd_changes_reach_the_authoritative_workspace_only_after_approval() {
     );
     let graph = Graph::open(&db).unwrap();
     let first_job = graph
-        .job_results_for_task("plans/promotion.plan.md#task-2")
+        .job_results_for_task("plans/promotion.plan.md#stage-safely")
         .unwrap()
         .pop()
         .unwrap();
@@ -604,7 +604,7 @@ fn staged_tdd_changes_reach_the_authoritative_workspace_only_after_approval() {
     );
     let graph = Graph::open(&db).unwrap();
     let second_job = graph
-        .job_results_for_task("plans/promotion.plan.md#task-2")
+        .job_results_for_task("plans/promotion.plan.md#stage-safely")
         .unwrap()
         .into_iter()
         .last()
@@ -631,7 +631,7 @@ fn staged_tdd_changes_reach_the_authoritative_workspace_only_after_approval() {
     assert_eq!(
         Graph::open(&db)
             .unwrap()
-            .task_state("plans/promotion.plan.md#task-2")
+            .task_state("plans/promotion.plan.md#stage-safely")
             .unwrap(),
         Some(TaskState::Done)
     );

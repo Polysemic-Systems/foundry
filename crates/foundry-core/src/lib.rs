@@ -10,6 +10,7 @@ pub mod graph;
 pub mod job;
 pub mod living;
 pub mod plan;
+pub mod plan_reconcile;
 pub mod review;
 pub mod rules;
 pub mod search;
@@ -22,7 +23,9 @@ pub mod migration_storage;
 
 pub use discourse::{DiscourseAct, DiscourseSpeaker, DiscourseTurn};
 pub use embed::{cosine_similarity, normalize};
-pub use event::{AnswerRecord, Event, QuestionRecord, RepairRecord, RuleResult};
+pub use event::{
+    AnswerRecord, Event, KeyMigrationRecord, QuestionRecord, RepairRecord, RuleResult,
+};
 pub use graph::{
     Edge, EdgeKind, Graph, JobResultRow, MigrationChecksumReport, MigrationChecksumStatus, Node,
     NodeKind,
@@ -36,7 +39,10 @@ pub use living::{
     ConformanceError, Disposition, GovernanceEnvelope, KnowledgeLayer, NamedAssumption,
     RetentionPolicy, SourceRef, Transformation,
 };
-pub use plan::Plan;
+pub use plan::{InvalidTaskId, Plan, PlanTask, TaskId};
+pub use plan_reconcile::{
+    LegacyKeyMigration, PlanReconcileReport, reconcile as reconcile_plan_report,
+};
 pub use review::{ReviewDraft, ReviewPerspective, ReviewResolution};
 pub use rules::{Rule, built_in_rules};
 pub use search::sanitize_query;
