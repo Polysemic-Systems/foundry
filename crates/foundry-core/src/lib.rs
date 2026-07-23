@@ -6,6 +6,7 @@ pub mod discourse;
 pub mod embed;
 pub mod event;
 pub mod evidence_store;
+pub mod evolution;
 pub mod graph;
 pub mod job;
 pub mod living;

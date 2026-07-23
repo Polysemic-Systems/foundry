@@ -3,6 +3,7 @@
 
 pub mod ask;
 pub mod common;
+pub mod evolution;
 pub mod iterate;
 pub mod job;
 pub mod plan;
