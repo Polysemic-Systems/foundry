@@ -355,16 +355,21 @@ mod tests {
     }
 
     #[test]
-    fn missing_spec_and_null_run_become_questions() {
+    fn missing_spec_questions_and_null_run_is_a_named_repair() {
         let raw = r#"{"tasks": [{"description": "one", "run": null}]}"#;
         let digested = digest_model_output("proposal", raw, &proposal_schema(), vec![])
             .expect("no answer error");
-        let DigestStatus::Clarify(questions) = digested.status else {
+        let DigestStatus::Clarify(questions) = &digested.status else {
             panic!("expected clarify");
         };
         let paths: Vec<&str> = questions.iter().map(|q| q.path.as_str()).collect();
         assert!(paths.contains(&"$.spec"), "paths: {paths:?}");
-        assert!(paths.contains(&"$.tasks[0].run"), "paths: {paths:?}");
+        // An explicit null on an optional field states an absence, so digest
+        // drops it as a named repair instead of asking a question whose
+        // answer cannot change the outcome.
+        assert!(!paths.contains(&"$.tasks[0].run"), "paths: {paths:?}");
+        let codes = repair_codes(&digested.repairs);
+        assert!(codes.contains(&"dropped_null_optional"), "codes: {codes:?}");
     }
 
     #[test]
