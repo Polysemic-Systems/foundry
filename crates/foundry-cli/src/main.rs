@@ -337,6 +337,11 @@ enum Commands {
         #[command(subcommand)]
         action: commands::snapshot::SnapshotAction,
     },
+    /// Render the recorded event log from the durable graph.
+    Evolution {
+        #[arg(long, default_value = "./.foundry/db.sqlite")]
+        db: PathBuf,
+    },
 }
 
 fn main() -> Result<()> {
@@ -502,14 +507,17 @@ fn main() -> Result<()> {
             model,
         } => commands::propose::cmd_propose(query.as_deref(), &plan, &root, &db, &model),
         Commands::Snapshot { action } => commands::snapshot::cmd_snapshot(action),
+        Commands::Evolution { db } => commands::evolution::cmd_evolution(&db),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::SOCRATIC_DISCOURSE_CONTRACT;
+    use super::{Cli, Commands, SOCRATIC_DISCOURSE_CONTRACT};
     use crate::commands::iterate::{IterationFeedback, feedback_prompt};
     use crate::commands::job::{CargoTestSummary, cargo_test_summary};
+    use clap::Parser;
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn rejected_review_is_rendered_as_durable_agent_feedback() {
@@ -555,5 +563,33 @@ test result: ok. 0 passed; 0 failed; 0 ignored; finished in 0.00s\n";
         ] {
             assert!(SOCRATIC_DISCOURSE_CONTRACT.contains(principle));
         }
+    }
+
+    #[test]
+    fn evolution_subcommand_parses_with_a_db_path() {
+        // `evolution` renders the recorded event log, which lives in the
+        // durable graph, so it takes --db like every other read command.
+        let cli = Cli::try_parse_from(["foundry", "evolution"])
+            .expect("`evolution` should be a recognized subcommand");
+        let Commands::Evolution { db } = cli.command else {
+            panic!("`foundry evolution` should parse to Commands::Evolution");
+        };
+        assert_eq!(db, PathBuf::from("./.foundry/db.sqlite"));
+
+        let cli = Cli::try_parse_from(["foundry", "evolution", "--db", "/tmp/history.sqlite"])
+            .expect("`evolution --db <path>` should parse");
+        let Commands::Evolution { db } = cli.command else {
+            panic!("`foundry evolution --db` should parse to Commands::Evolution");
+        };
+        assert_eq!(db, PathBuf::from("/tmp/history.sqlite"));
+    }
+
+    #[test]
+    fn evolution_dispatches_to_the_commands_evolution_module() {
+        // main.rs stays a thin dispatch shell: the subcommand's handler lives
+        // in the dedicated commands::evolution module under the standard
+        // cmd_* signature shared by the other read commands.
+        let handler: fn(&Path) -> anyhow::Result<()> = crate::commands::evolution::cmd_evolution;
+        let _ = handler;
     }
 }
