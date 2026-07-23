@@ -33,7 +33,7 @@ jobs:
         uses: actions/checkout@v6
         with:
           repository: Polysemic-Systems/polysemic
-          ref: 6294bf80c85c7da33360a4e3bfd00dd962da7710
+          ref: eaa880cb3ee87a5a3b930b85c8552947c92ccc60
           path: polysemic
 
       # The TDD vertical-slice tests exercise real Bubblewrap isolation.
